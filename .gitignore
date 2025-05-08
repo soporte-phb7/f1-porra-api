@@ -1,0 +1,37 @@
+# Fichero de credenciales de Firebase (¡MUY IMPORTANTE!)
+f1-porra-app-links-firebase-adminsdk-*.json  # Ignora cualquier fichero que empiece así y termine en .json
+# O si sabes el nombre exacto: firebase-adminsdk-AB123-XYZ.json
+
+# Fichero de variables de entorno local (si usas uno)
+.env
+
+# Carpetas de entorno virtual Python (comunes)
+venv/
+*.venv/
+env/
+*/env/
+*/venv/
+env.bak/
+venv.bak/
+
+# Ficheros compilados y caché de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ficheros específicos de IDEs (opcional pero recomendado)
+.vscode/
+.idea/
+
+# Ficheros del sistema operativo
+.DS_Store
+Thumbs.db
+
+# Ficheros sql de la carpeta de trabajo
+
+*.sql
+*.bak
+mi_api_backup.py
+dockerfile
+generar_script_apuestas.py
+prueba.py

@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.git
+.gitignore
+venv/
+*.db # Si alguna vez usaste sqlite localmente
+codigoSendGrid.txt
+llamadas_postman.txt
+*.sql
+*.bak
+mi_api_backup.py
