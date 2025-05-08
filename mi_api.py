@@ -3285,13 +3285,13 @@ def confirm_password_reset():
             conn.close()
 
 # --- NUEVO Endpoint GET /api/verify-email ---
-# Procesa el token de verificación recibido como parámetro query.
+# --- REEMPLAZA ESTA FUNCIÓN COMPLETA en mi_api.py ---
 @app.route('/api/verify-email', methods=['GET'])
 def verify_email():
-    # El token viene como parámetro en la URL, ej: /api/verify-email?token=ABCXYZ
     token = request.args.get('token') # Obtener token de los parámetros query
+    print(f"DEBUG [verify_email]: Received verification request with token (first 5 chars): {token[:5]}..." if token else "No token received.") # Log token recibido (parcialmente)
 
-    # --- HTML para respuestas ---
+    # --- HTML para respuestas (sin cambios) ---
     html_success = """
     <!DOCTYPE html><html><head><title>Verificación Exitosa</title><style>body{font-family: sans-serif; padding: 20px; text-align: center; background-color: #e8f5e9;} .card{background-color: #fff; border-radius: 8px; padding: 30px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); display: inline-block;} h1{color: #2e7d32;} p{font-size: 1.1em;}</style></head>
     <body><div class="card"><h1>&#10004; ¡Email Verificado!</h1><p>Tu dirección de correo ha sido verificada correctamente.</p><p>Ya puedes cerrar esta pestaña e iniciar sesión en la aplicación F1 Porra.</p></div></body></html>
@@ -3304,18 +3304,20 @@ def verify_email():
     # --- Fin HTML ---
 
     if not token:
-        # return jsonify({"error": "Falta el token de verificación"}), 400
+        print("ERROR [verify_email]: No token provided in the request.")
         response = make_response(create_html_error("Falta el token de verificación en el enlace."), 400)
         response.headers['Content-Type'] = 'text/html'
         return response
 
     conn = None
     try:
-        conn = psycopg2.connect(host=DB_HOST,port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
+        conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        print("DEBUG [verify_email]: Database connection established.")
 
         # --- 1. Buscar el token y verificar su expiración ---
         now_utc = datetime.now(timezone.utc)
+        print(f"DEBUG [verify_email]: Searching for token (first 5: {token[:5]}...)")
         sql_find_token = """
             SELECT id_usuario, token_verificacion_expira, email_verificado
             FROM usuario
@@ -3325,16 +3327,19 @@ def verify_email():
         user_data = cur.fetchone()
 
         if not user_data:
-            # No se encontró usuario con ese token (o ya fue verificado/borrado)
-            # return jsonify({"error": "Token de verificación inválido o ya utilizado"}), 400 # O 404
+            print(f"WARN [verify_email]: Token not found or already used/cleared (first 5: {token[:5]}...).")
             response = make_response(create_html_error("El token de verificación es inválido o ya ha sido utilizado."), 400)
             response.headers['Content-Type'] = 'text/html'
-            cur.close() # Cerrar cursor antes de devolver
-            conn.close() # Cerrar conexión
+            cur.close()
+            conn.close()
             return response
 
-        # Verificar si el email ya está verificado (podría pasar si se hace clic dos veces)
+        id_usuario_a_verificar = user_data['id_usuario']
+        print(f"DEBUG [verify_email]: Token found for user ID: {id_usuario_a_verificar}.")
+
+        # Verificar si el email ya está verificado
         if user_data['email_verificado']:
+             print(f"INFO [verify_email]: Email for user {id_usuario_a_verificar} is already verified.")
              response = make_response(html_success, 200) # Ya está verificado, mostrar éxito
              response.headers['Content-Type'] = 'text/html'
              cur.close()
@@ -3343,20 +3348,23 @@ def verify_email():
 
         # Verificar si el token ha expirado
         expiry_time = user_data['token_verificacion_expira']
+        print(f"DEBUG [verify_email]: Token expires at (UTC): {expiry_time}. Current time (UTC): {now_utc}")
         if expiry_time is None or now_utc > expiry_time:
-             # Limpiar token expirado para evitar reutilización (opcional pero bueno)
-             sql_clear_expired = "UPDATE usuario SET token_verificacion = NULL, token_verificacion_expira = NULL WHERE token_verificacion = %s;"
-             cur.execute(sql_clear_expired, (token,))
-             conn.commit()
+             print(f"WARN [verify_email]: Token expired for user {id_usuario_a_verificar}.")
+             # Limpiar token expirado para evitar reutilización
+             print(f"DEBUG [verify_email]: Clearing expired token for user {id_usuario_a_verificar}.")
+             sql_clear_expired = "UPDATE usuario SET token_verificacion = NULL, token_verificacion_expira = NULL WHERE id_usuario = %s;"
+             cur.execute(sql_clear_expired, (id_usuario_a_verificar,))
+             conn.commit() # <-- IMPORTANTE: Commit la limpieza del token expirado
+             print(f"DEBUG [verify_email]: Expired token cleared and committed for user {id_usuario_a_verificar}.")
              cur.close()
              conn.close()
-             # return jsonify({"error": "El token de verificación ha expirado"}), 400 # O 410 Gone
              response = make_response(create_html_error("El token de verificación ha expirado."), 400)
              response.headers['Content-Type'] = 'text/html'
              return response
 
-        # --- Token válido y no expirado ---
-        id_usuario_a_verificar = user_data['id_usuario']
+        # --- Token válido, no expirado y usuario no verificado ---
+        print(f"DEBUG [verify_email]: Token is valid for user {id_usuario_a_verificar}. Proceeding with verification.")
 
         # --- 2. Marcar email como verificado y limpiar token ---
         sql_verify = """
@@ -3366,28 +3374,52 @@ def verify_email():
                 token_verificacion_expira = NULL
             WHERE id_usuario = %s;
         """
+        print(f"DEBUG [verify_email]: Executing UPDATE statement for user {id_usuario_a_verificar}...")
         cur.execute(sql_verify, (id_usuario_a_verificar,))
+        print(f"DEBUG [verify_email]: UPDATE executed. Rows affected: {cur.rowcount}")
 
+        # --- 3. COMMIT DE LA TRANSACCIÓN ---
+        # ¡Este es el paso crítico! Asegurarse de que los cambios se guardan en la BD.
+        print(f"DEBUG [verify_email]: Committing transaction for user {id_usuario_a_verificar}...")
         conn.commit()
-        cur.close()
+        print(f"DEBUG [verify_email]: Transaction committed successfully for user {id_usuario_a_verificar}.")
 
-        # return jsonify({"mensaje": "Email verificado correctamente. ¡Ya puedes iniciar sesión!"}), 200
+        cur.close()
+        print("DEBUG [verify_email]: Cursor closed.")
+        conn.close()
+        print("DEBUG [verify_email]: Connection closed.")
+
         response = make_response(html_success, 200)
+        response.headers['Content-Type'] = 'text/html'
+        print(f"INFO [verify_email]: Verification successful for user {id_usuario_a_verificar}. Returning success HTML.")
+        return response
+
+    except psycopg2.Error as db_err: # Capturar errores específicos de BD
+        print(f"!!!!!!!! DATABASE ERROR [verify_email] !!!!!!!!")
+        print(f"Error Type: {type(db_err)}")
+        print(f"Error Details: {db_err}")
+        if conn: conn.rollback() # Deshacer cambios si hubo error DB
+        response = make_response(create_html_error(f"Error de base de datos durante la verificación."), 500)
         response.headers['Content-Type'] = 'text/html'
         return response
 
-    except (Exception, psycopg2.DatabaseError) as error:
+    except Exception as error:
         import traceback
-        print(f"ERROR DETALLADO en verify_email:")
-        traceback.print_exc()
+        print(f"!!!!!!!! UNEXPECTED ERROR [verify_email] !!!!!!!!")
+        traceback.print_exc() # Imprime el stack trace completo en los logs de la API
         if conn: conn.rollback()
-        # return jsonify({"error": "Error interno al verificar el email"}), 500
-        response = make_response(create_html_error(f"Error interno del servidor al procesar la verificación. ({error})"), 500)
+        response = make_response(create_html_error(f"Error interno del servidor durante la verificación."), 500)
         response.headers['Content-Type'] = 'text/html'
         return response
     finally:
+        # Asegurar que la conexión se cierra si todavía está abierta
         if conn is not None and not conn.closed:
+            try:
+                cur.close() # Intenta cerrar cursor si existe
+            except: pass
             conn.close()
+            print("DEBUG [verify_email]: Connection closed in finally block.")
+# --- FIN FUNCIÓN verify_email MODIFICADA ---
 
 # --- NUEVO Endpoint POST /api/resend-verification ---
 # Reenvía el email de verificación si la cuenta existe y no está verificada.
