@@ -107,6 +107,7 @@ jwt = JWTManager(app) # Inicializa JWTManager con tu app
 # Es MUY RECOMENDABLE usar variables de entorno para esto en producción
 # Para probar localmente, puedes definirlas temporalmente o crear un archivo .env
 app.config["JWT_SECRET_KEY"] = os.environ.get('JWT_SECRET_KEY', 'cambiar-esta-clave-secreta-ya!')
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(days=14)
 app.config['MAIL_PASSWORD'] = os.environ.get('SENDGRID_API_KEY') # ¡Obligatorio!
 app.config['MAIL_DEFAULT_SENDER'] = os.environ.get('MAIL_SENDER') # ¡Obligatorio!
 app.config['MAIL_SERVER'] = 'smtp.sendgrid.net'
@@ -881,20 +882,81 @@ def _award_trophy(user_id, trofeo_codigo, conn, cur, detalles=None):
 # --- FIN Función Auxiliar MODIFICADA ---
 
 
+# --- Endpoint GET /api/usuarios (MODIFICADO para búsqueda paginada y exclusiones) ---
 @app.route('/api/usuarios', methods=['GET'])
+@jwt_required() # <-- AÑADIR JWT REQUERIDO para saber quién busca y para exclusiones
 def obtener_usuarios():
     conn = None
     try:
-        conn = psycopg2.connect(host=DB_HOST,port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
+        id_usuario_actual_str = get_jwt_identity()
+        id_usuario_actual_int = int(id_usuario_actual_str)
+
+        # Parámetros de paginación y búsqueda
+        page = request.args.get('page', 1, type=int)
+        page_size = request.args.get('page_size', 10, type=int)
+        search_query = request.args.get('search', '', type=str)
+        # Parámetro para excluir miembros de una porra específica (opcional)
+        exclude_porra_id_str = request.args.get('exclude_porra_id', None)
+
+        if page < 1: page = 1
+        if page_size < 1: page_size = 10
+        if page_size > 50: page_size = 50 # Limitar tamaño de página
+        offset = (page - 1) * page_size
+
+        conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-         # Seleccionamos solo id y nombre, no email ni hash de contraseña
-        cur.execute("SELECT id_usuario, nombre FROM usuario ORDER BY nombre;")
-        usuarios = cur.fetchall()
+
+        base_sql = " FROM usuario u WHERE u.id_usuario != %s " # Excluir al usuario actual
+        params = [id_usuario_actual_int]
+
+        # Búsqueda por nombre (case-insensitive)
+        if search_query:
+            base_sql += " AND u.nombre ILIKE %s " # ILIKE para case-insensitive
+            params.append(f"%{search_query}%")
+
+        # Excluir miembros de una porra específica
+        if exclude_porra_id_str:
+            try:
+                exclude_porra_id_int = int(exclude_porra_id_str)
+                base_sql += """
+                    AND u.id_usuario NOT IN (
+                        SELECT pa.id_usuario FROM participacion pa
+                        WHERE pa.id_porra = %s AND pa.estado IN ('CREADOR', 'ACEPTADA', 'PENDIENTE')
+                    )
+                """
+                params.append(exclude_porra_id_int)
+            except ValueError:
+                print(f"WARN: Invalid exclude_porra_id value: {exclude_porra_id_str}")
+                # No hacer nada si el ID de porra no es válido, o devolver error 400
+
+
+        # --- Contar total de items para paginación ---
+        count_sql = "SELECT COUNT(u.id_usuario) " + base_sql
+        cur.execute(count_sql, tuple(params))
+        total_items = cur.fetchone()[0]
+
+        # --- Obtener la página de usuarios ---
+        # Seleccionamos solo id y nombre, no email ni hash de contraseña
+        # Ordenar por nombre para consistencia
+        main_query_sql = "SELECT u.id_usuario, u.nombre " + base_sql + " ORDER BY u.nombre ASC LIMIT %s OFFSET %s;"
+        params.extend([page_size, offset])
+        cur.execute(main_query_sql, tuple(params))
+        usuarios_db = cur.fetchall()
         cur.close()
-        lista_usuarios = [dict(usuario) for usuario in usuarios]
-        return jsonify(lista_usuarios)
+
+        lista_usuarios = [dict(usuario) for usuario in usuarios_db]
+
+        return jsonify({
+            "total_items": total_items,
+            "page": page,
+            "page_size": page_size,
+            "items": lista_usuarios
+        })
+
     except (Exception, psycopg2.DatabaseError) as error:
-        print(f"Error en obtener_usuarios: {error}")
+        print(f"Error en obtener_usuarios (paginado): {error}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": "No se pudieron obtener los usuarios"}), 500
     finally:
         if conn is not None:
@@ -902,6 +964,46 @@ def obtener_usuarios():
 
 # --- INICIO: Función obtener_carreras MODIFICADA (mi_api.txt) ---
 # REEMPLAZA ESTA FUNCIÓN COMPLETA
+# ... (importaciones existentes y configuración de la app Flask) ...
+# Asegúrate de que flask_jwt_extended y otras dependencias están importadas.
+
+# --- NUEVO Endpoint GET /api/auth/me ---
+# Devuelve información del usuario autenticado si el token es válido
+@app.route('/api/auth/me', methods=['GET'])
+@jwt_required()
+def get_current_user_profile():
+    current_user_id_str = get_jwt_identity() # Obtiene el 'sub' (ID de usuario) del token JWT
+    conn = None
+    try:
+        current_user_id_int = int(current_user_id_str)
+        conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+        cur.execute("SELECT id_usuario, nombre, email, es_admin FROM usuario WHERE id_usuario = %s;", (current_user_id_int,))
+        user_data = cur.fetchone()
+        cur.close()
+
+        if user_data:
+            return jsonify({
+                "id_usuario": user_data["id_usuario"],
+                "nombre": user_data["nombre"],
+                "email": user_data["email"],
+                "es_admin": user_data["es_admin"]
+            }), 200
+        else:
+            # Esto no debería ocurrir si el token es válido y el usuario existe,
+            # pero es una salvaguarda.
+            return jsonify({"error": "Usuario no encontrado con el token proporcionado"}), 404
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"Error en get_current_user_profile: {error}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": "Error interno al obtener el perfil del usuario"}), 500
+    finally:
+        if conn is not None:
+            conn.close()
+
 
 # --- Endpoint GET /api/carreras (MODIFICADO para incluir resultado_detallado) ---
 @app.route('/api/carreras', methods=['GET'])
@@ -1255,7 +1357,7 @@ def registrar_o_actualizar_apuesta(id_porra):
 # --- FIN Endpoint POST Apuestas MODIFICADO ---
 
 # --- NUEVO Endpoint POST /api/login ---
-# --- Endpoint POST /api/login (MODIFICADO para requerir Email Verificado y añadir claim de admin) ---
+# --- Endpoint POST /api/login (MODIFICADO para requerir Email Verificado y añadir claim de admin Y NOMBRE) ---
 @app.route('/api/login', methods=['POST'])
 def login_usuario():
     if not request.is_json:
@@ -1271,35 +1373,30 @@ def login_usuario():
         conn = psycopg2.connect(host=DB_HOST,port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-        # Buscamos al usuario y AÑADIMOS email_verificado y es_admin
-        sql = "SELECT id_usuario, nombre, email, password_hash, email_verificado, es_admin FROM usuario WHERE email = %s;" # Añadido es_admin
+        # Buscamos al usuario y AÑADIMOS email_verificado, es_admin y nombre
+        sql = "SELECT id_usuario, nombre, email, password_hash, email_verificado, es_admin FROM usuario WHERE email = %s;"
         cur.execute(sql, (email,))
         user = cur.fetchone()
         cur.close()
 
-        # Primero, verifica si el usuario existe Y si la contraseña es correcta
         if user and check_password_hash(user['password_hash'], password):
-
-            # Si la contraseña es correcta, AHORA comprueba si el email está verificado
             if not user['email_verificado']:
-                # El email NO está verificado, denegar login
-                return jsonify({"error": "Email no verificado. Por favor, revisa tu bandeja de entrada y haz clic en el enlace de verificación."}), 403 # 403 Forbidden
+                return jsonify({"error": "Email no verificado. Por favor, revisa tu bandeja de entrada y haz clic en el enlace de verificación."}), 403
 
-            # --- Email verificado y contraseña correcta: Proceder a crear token ---
-            # **** CORRECCIÓN DE INDENTACIÓN AQUÍ ****
-            # Esta lógica debe estar fuera del if de 'email_verificado' pero dentro del if principal de 'user and check_password...'
-            admin_status = user['es_admin'] # Obtener el estado de admin de la BD
-            additional_claims = {"is_admin": admin_status}
+            # Email verificado y contraseña correcta: Proceder a crear token
+            admin_status = user['es_admin']
+            user_name = user['nombre'] # <<< OBTENER EL NOMBRE DEL USUARIO
+            additional_claims = {
+                "is_admin": admin_status,
+                "nombre_usuario": user_name  # <<< AÑADIR EL NOMBRE AL TOKEN
+            }
             access_token = create_access_token(
-                identity=str(user['id_usuario']), # Sigue siendo el ID del usuario
-                additional_claims=additional_claims # Añadimos el claim
+                identity=str(user['id_usuario']),
+                additional_claims=additional_claims
             )
-            return jsonify(access_token=access_token), 200 # 200 OK
-            # **** FIN CORRECCIÓN DE INDENTACIÓN ****
-
+            return jsonify(access_token=access_token), 200
         else:
-            # Usuario no encontrado o contraseña incorrecta
-            return jsonify({"error": "Credenciales inválidas"}), 401 # 401 Unauthorized
+            return jsonify({"error": "Credenciales inválidas"}), 401
 
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"Error en login_usuario: {error}")
