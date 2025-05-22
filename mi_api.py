@@ -133,33 +133,27 @@ thread_pool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WOR
 print(f"INFO: ThreadPoolExecutor inicializado con max_workers={MAX_WORKERS_FCM}")
 # --- FIN NUEVO ---
 
-# --- Nueva Función para Comprobar Fechas Límite y Notificar ---
+# --- check_deadlines_and_notify MODIFICADA (v2 - notifica una vez por usuario/carrera) ---
 def check_deadlines_and_notify():
     """
     Tarea programada para buscar carreras cuya fecha límite está próxima
-    y notificar a los usuarios participantes que aún no han apostado.
+    y notificar UNA VEZ a los usuarios participantes que aún no han apostado para esa carrera.
     """
     print(f"\n--- TAREA PROGRAMADA: Iniciando check_deadlines_and_notify ({datetime.now()}) ---")
     conn = None
-    users_notified_this_run = set() # Para evitar notificar >1 vez por usuario en esta ejecución
+    cur = None 
 
     try:
-        # --- Conectar a la BD ---
-        # ¡Importante! Cada ejecución de la tarea necesita su propia conexión
         conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        print("TAREA: Conexión DB establecida.")
+        print("TAREA DEADLINE: Conexión DB establecida.")
 
-        # --- Calcular ventana de tiempo ---
         now = datetime.now(timezone.utc)
-        # Buscamos carreras cuya fecha límite esté entre AHORA y (AHORA + 10 horas + un pequeño margen)
-        # El margen evita notificar exactamente en la hora si la tarea corre un poco después.
-        reminder_threshold_start = now + timedelta(hours=9, minutes=35) # Ligeramente antes de 10h
-        reminder_threshold_end = now + timedelta(hours=10, minutes=30)  # Ligeramente después de 10h
+        reminder_threshold_start = now + timedelta(hours=9, minutes=35) 
+        reminder_threshold_end = now + timedelta(hours=10, minutes=30)
 
-        print(f"TAREA: Buscando carreras con fecha límite entre {reminder_threshold_start.isoformat()} y {reminder_threshold_end.isoformat()}")
+        print(f"TAREA DEADLINE: Buscando carreras con fecha límite entre {reminder_threshold_start.isoformat()} y {reminder_threshold_end.isoformat()}")
 
-        # --- Buscar carreras en la ventana ---
         sql_find_races = """
             SELECT id_carrera, ano, desc_carrera, fecha_limite_apuesta
             FROM carrera
@@ -167,102 +161,94 @@ def check_deadlines_and_notify():
         """
         cur.execute(sql_find_races, (reminder_threshold_start, reminder_threshold_end))
         upcoming_races = cur.fetchall()
-        print(f"TAREA: Encontradas {len(upcoming_races)} carreras próximas.")
+        print(f"TAREA DEADLINE: Encontradas {len(upcoming_races)} carreras próximas.")
 
         if not upcoming_races:
-            cur.close()
-            conn.close()
-            print("TAREA: No hay carreras en la ventana de recordatorio. Finalizando.")
+            cur.close(); conn.close()
+            print("TAREA DEADLINE: No hay carreras en la ventana de recordatorio. Finalizando.")
             return
 
-        # --- Procesar cada carrera encontrada ---
         for race in upcoming_races:
             id_carrera = race['id_carrera']
             ano_carrera = race['ano']
             desc_carrera = race['desc_carrera']
             fecha_limite = race['fecha_limite_apuesta']
-            fecha_limite_str = fecha_limite.astimezone(ZoneInfo("Europe/Madrid")).strftime('%d/%m %H:%M') # Formato legible
-            print(f"\nTAREA: Procesando carrera ID {id_carrera} ('{desc_carrera}') - Límite: {fecha_limite_str}")
+            # Asegurar que fecha_limite tenga timezone para un formato consistente
+            if fecha_limite.tzinfo is None:
+                fecha_limite_aware = ZoneInfo("Europe/Madrid").localize(fecha_limite) if not isinstance(fecha_limite, datetime) else fecha_limite.replace(tzinfo=ZoneInfo("Europe/Madrid"))
+            else:
+                fecha_limite_aware = fecha_limite.astimezone(ZoneInfo("Europe/Madrid"))
+            fecha_limite_str = fecha_limite_aware.strftime('%d/%m %H:%M')
 
-            tokens_to_notify_for_this_race = []
-            users_already_notified_for_this_race = set() # Usuarios ya en la lista para esta carrera
 
-            # Buscar porras activas para el año de la carrera
+            print(f"\nTAREA DEADLINE: Procesando carrera ID {id_carrera} ('{desc_carrera}') - Límite: {fecha_limite_str}")
+
+            # Usuarios únicos que necesitan recordatorio para ESTA CARRERA y sus tokens
+            unique_users_needing_reminder_for_race = {} # {user_id: fcm_token}
+
             cur.execute("SELECT id_porra FROM porra WHERE ano = %s;", (ano_carrera,))
             porras = cur.fetchall()
-            print(f"TAREA: Encontradas {len(porras)} porras para el año {ano_carrera}.")
+            if not porras:
+                print(f"  TAREA DEADLINE: No hay porras para el año {ano_carrera}. Saltando carrera '{desc_carrera}'.")
+                continue
+            
+            print(f"  TAREA DEADLINE: Encontradas {len(porras)} porras para el año {ano_carrera} para la carrera '{desc_carrera}'.")
 
             for porra in porras:
                 id_porra = porra['id_porra']
-                print(f"  TAREA: Verificando porra ID {id_porra}...")
+                # print(f"    TAREA DEADLINE: Verificando porra ID {id_porra}...")
 
-                # Obtener participantes activos
-                sql_participants = """
-                    SELECT id_usuario FROM participacion
-                    WHERE id_porra = %s AND estado IN ('CREADOR', 'ACEPTADA');
-                """
+                sql_participants = "SELECT id_usuario FROM participacion WHERE id_porra = %s AND estado IN ('CREADOR', 'ACEPTADA');"
                 cur.execute(sql_participants, (id_porra,))
-                participants = {row['id_usuario'] for row in cur.fetchall()}
-                if not participants:
-                    print(f"    TAREA: Porra {id_porra} sin participantes activos. Saltando.")
+                participants_in_porra = {row['id_usuario'] for row in cur.fetchall()}
+                if not participants_in_porra:
+                    # print(f"      TAREA DEADLINE: Porra {id_porra} sin participantes activos. Saltando.")
                     continue
-                print(f"    TAREA: Porra {id_porra} tiene {len(participants)} participantes activos.")
 
-                # Obtener usuarios que SÍ han apostado en esta carrera/porra
-                sql_who_bet = """
-                    SELECT DISTINCT id_usuario FROM apuesta
-                    WHERE id_porra = %s AND id_carrera = %s;
-                """
+                sql_who_bet = "SELECT DISTINCT id_usuario FROM apuesta WHERE id_porra = %s AND id_carrera = %s;"
                 cur.execute(sql_who_bet, (id_porra, id_carrera))
-                users_who_bet = {row['id_usuario'] for row in cur.fetchall()}
-                print(f"    TAREA: {len(users_who_bet)} usuarios ya han apostado en carrera {id_carrera} / porra {id_porra}.")
+                users_who_bet_in_porra = {row['id_usuario'] for row in cur.fetchall()}
+                
+                users_needing_reminder_in_porra = participants_in_porra - users_who_bet_in_porra
 
-                # Encontrar usuarios que NO han apostado
-                users_needing_reminder = participants - users_who_bet
-                print(f"    TAREA: {len(users_needing_reminder)} usuarios necesitan recordatorio para porra {id_porra}.")
-
-                if not users_needing_reminder:
-                    continue
-
-                # Obtener tokens FCM para estos usuarios (y evitar duplicados globales)
-                user_ids_to_query = list(users_needing_reminder - users_notified_this_run)
-                if not user_ids_to_query:
-                    print(f"    TAREA: Usuarios ya notificados en esta ejecución. Saltando query de tokens.")
-                    continue
-
-                # Usar un placeholder IN (%s) que funcione con tuplas
-                placeholders = ','.join(['%s'] * len(user_ids_to_query))
-                sql_get_tokens = f"""
-                    SELECT id_usuario, fcm_token FROM usuario
-                    WHERE id_usuario IN ({placeholders}) AND fcm_token IS NOT NULL AND fcm_token != '';
-                """
-                cur.execute(sql_get_tokens, tuple(user_ids_to_query))
-                tokens_found = cur.fetchall()
-
-                for user_token_row in tokens_found:
-                    user_id = user_token_row['id_usuario']
-                    token = user_token_row['fcm_token']
-                    if user_id not in users_notified_this_run:
-                         tokens_to_notify_for_this_race.append(token)
-                         users_notified_this_run.add(user_id) # Marcar como notificado en esta ejecución global
-                         users_already_notified_for_this_race.add(user_id) # Marcar para esta carrera específica (por si acaso)
-
-                print(f"    TAREA: Añadidos {len(tokens_found)} tokens a la lista de esta carrera (total ahora: {len(tokens_to_notify_for_this_race)}).")
-
-            # --- Enviar notificaciones para ESTA CARRERA ---
-            if tokens_to_notify_for_this_race:
-                send_bulk_fcm_reminders(tokens_to_notify_for_this_race, desc_carrera, fecha_limite_str)
+                if users_needing_reminder_in_porra:
+                    # print(f"      TAREA DEADLINE: {len(users_needing_reminder_in_porra)} usuarios necesitan recordatorio en porra {id_porra}.")
+                    # Obtener tokens FCM para estos usuarios si aún no los tenemos para esta carrera
+                    user_ids_to_query_tokens = list(users_needing_reminder_in_porra - unique_users_needing_reminder_for_race.keys())
+                    if user_ids_to_query_tokens:
+                        placeholders = ','.join(['%s'] * len(user_ids_to_query_tokens))
+                        sql_get_tokens = f"""
+                            SELECT id_usuario, fcm_token FROM usuario
+                            WHERE id_usuario IN ({placeholders}) AND fcm_token IS NOT NULL AND fcm_token != '';
+                        """
+                        cur.execute(sql_get_tokens, tuple(user_ids_to_query_tokens))
+                        tokens_found = cur.fetchall()
+                        for user_token_row in tokens_found:
+                            unique_users_needing_reminder_for_race[user_token_row['id_usuario']] = user_token_row['fcm_token']
+            
+            # Enviar notificaciones masivas UNA VEZ por carrera con los tokens únicos recolectados
+            fcm_tokens_for_this_race_event = list(unique_users_needing_reminder_for_race.values())
+            if fcm_tokens_for_this_race_event:
+                print(f"  TAREA DEADLINE: Enviando recordatorio para {len(fcm_tokens_for_this_race_event)} usuarios únicos para la carrera '{desc_carrera}'.")
+                # La función send_bulk_fcm_reminders ya es genérica y envía a una lista de tokens
+                # y el mensaje es sobre la carrera, no una porra específica.
+                # Se le pasa 'desc_carrera' y 'fecha_limite_str'.
+                # La data payload también debe ser genérica:
+                data_payload = {
+                    'tipo_notificacion': 'deadline_reminder',
+                    'race_name': desc_carrera,
+                    'race_id': str(id_carrera), # Añadido
+                    'ano_carrera': str(ano_carrera) # Añadido
+                }
+                send_bulk_fcm_reminders_generic(fcm_tokens_for_this_race_event, desc_carrera, fecha_limite_str, data_payload)
             else:
-                print(f"TAREA: No hay nuevos tokens que notificar para la carrera '{desc_carrera}'.")
-
-        # --- Fin del bucle de carreras ---
+                print(f"  TAREA DEADLINE: No hay nuevos usuarios/tokens que notificar para la carrera '{desc_carrera}'.")
 
     except psycopg2.Error as db_err:
-        print(f"!!!!!!!! TAREA PROGRAMADA DB ERROR !!!!!!!!")
+        print(f"!!!!!!!! TAREA DEADLINE PROGRAMADA DB ERROR !!!!!!!!")
         print(f"ERROR: {db_err}")
-        # Podrías añadir logging más detallado aquí
     except Exception as e:
-        print(f"!!!!!!!! TAREA PROGRAMADA GENERAL ERROR !!!!!!!!")
+        print(f"!!!!!!!! TAREA DEADLINE PROGRAMADA GENERAL ERROR !!!!!!!!")
         import traceback
         traceback.print_exc()
     finally:
@@ -270,81 +256,50 @@ def check_deadlines_and_notify():
         if conn is not None: conn.close()
         print(f"--- TAREA PROGRAMADA: Finalizando check_deadlines_and_notify ({datetime.now()}) ---\n")
 
-# --- FIN Nueva Función ---
+# --- FIN check_deadlines_and_notify MODIFICADA ---
 
-# --- Nueva Función para Enviar Recordatorios Masivos ---
-# --- Función send_bulk_fcm_reminders (con logging extra) ---
-# --- Función para Enviar Recordatorios (Versión con Bucle y messaging.send) ---
-# REEMPLAZA ESTA FUNCIÓN COMPLETA en mi_api.txt
-
-# --- Función para Enviar Recordatorios (Versión con send_all - RECOMENDADA) ---
-# REEMPLAZA ESTA FUNCIÓN COMPLETA en mi_api.txt
-
-# --- Función Principal para Enviar Recordatorios (Versión Paralela con Executor) ---
-# REEMPLAZA ESTA FUNCIÓN COMPLETA en mi_api.txt
-
-# --- Función Principal para Enviar Recordatorios (Versión ThreadPoolExecutor) ---
-# REEMPLAZA ESTA FUNCIÓN COMPLETA en mi_api.txt
-
-def send_bulk_fcm_reminders(tokens, race_name, deadline_str):
+# --- send_bulk_fcm_reminders_generic (NUEVA o versión modificada de send_bulk_fcm_reminders) ---
+def send_bulk_fcm_reminders_generic(tokens, race_name, deadline_str, data_payload):
     """
     Prepara y envía notificaciones de recordatorio a una lista de tokens FCM
-    en paralelo usando concurrent.futures.ThreadPoolExecutor.
+    en paralelo usando concurrent.futures.ThreadPoolExecutor, con un data_payload personalizable.
     """
-    # Acceder al executor estándar global
     global thread_pool_executor
 
     if not tokens:
-        print("RECORDATORIO FCM (ThreadPool): No hay tokens a los que enviar.")
+        print("RECORDATORIO FCM (Generic): No hay tokens a los que enviar.")
         return
 
-    unique_tokens = list(set(t for t in tokens if t)) # Limpiar tokens
+    unique_tokens = list(set(t for t in tokens if t)) 
     if not unique_tokens:
-         print("RECORDATORIO FCM (ThreadPool): No hay tokens válidos después de limpiar.")
+         print("RECORDATORIO FCM (Generic): No hay tokens válidos después de limpiar.")
          return
 
-    print(f"RECORDATORIO FCM (ThreadPool): Preparando {len(unique_tokens)} tareas de envío para '{race_name}'...")
+    print(f"RECORDATORIO FCM (Generic): Preparando {len(unique_tokens)} tareas de envío para '{race_name}'...")
 
     submitted_count = 0
-    # --- Bucle para preparar y enviar tareas al executor ---
     for token in unique_tokens:
-        # Crear el objeto Message para este token (igual que antes)
         message = messaging.Message(
             notification=messaging.Notification(
                 title="⏰ ¡Última Oportunidad para Apostar!",
                 body=f"La fecha límite para apostar en {race_name} es pronto ({deadline_str}). ¡No te olvides!"
             ),
-            data={
-                'tipo_notificacion': 'deadline_reminder',
-                'race_name': race_name
-            },
+            data=data_payload, # Usar el data_payload proporcionado
             token=token
         )
 
-        # --- USAR EL NUEVO EXECUTOR ---
         try:
-            # Verificar que el executor estándar está disponible
             if thread_pool_executor is None:
-                 print("!!!!!!!! RECORDATORIO FCM ERROR (ThreadPool): ¡¡ThreadPoolExecutor no está inicializado!! !!!!!!!!!!")
-                 continue # Saltar este token
-
-            # Enviar la MISMA función tarea auxiliar (_send_single_reminder_task)
-            # al executor estándar. Ya no necesita contexto Flask.
-            thread_pool_executor.submit(_send_single_reminder_task, message)
+                 print("!!!!!!!! RECORDATORIO FCM ERROR (Generic): ¡¡ThreadPoolExecutor no está inicializado!! !!!!!!!!!!")
+                 continue 
+            thread_pool_executor.submit(_send_single_reminder_task, message) # Reutiliza _send_single_reminder_task
             submitted_count += 1
         except Exception as submit_err:
-             print(f"!!!!!!!! RECORDATORIO FCM ERROR (ThreadPool): Fallo al hacer submit para token ...{token[-10:]}. Error: {submit_err} !!!!!!!!!!")
-        # --- FIN USO NUEVO EXECUTOR ---
+             print(f"!!!!!!!! RECORDATORIO FCM ERROR (Generic): Fallo al hacer submit para token ...{token[-10:]}. Error: {submit_err} !!!!!!!!!!")
+        
+    print(f"RECORDATORIO FCM (Generic): {submitted_count} tareas de envío para '{race_name}' enviadas al ThreadPoolExecutor.")
 
-    # --- Fin del Bucle ---
-    print(f"RECORDATORIO FCM (ThreadPool): {submitted_count} tareas de envío para '{race_name}' enviadas al ThreadPoolExecutor.")
-    # El resultado se verá en los logs de _send_single_reminder_task
-
-# --- FIN Función send_bulk_fcm_reminders (Versión ThreadPoolExecutor) ---
-
-# --- La función _send_single_reminder_task (definida anteriormente) NO necesita cambios ---
-# Asegúrate de que sigue existiendo en tu código.
-# --- FIN Nueva Función ---
+# --- FIN send_bulk_fcm_reminders_generic ---
 
 # --- Nueva Función para Tarea en Background ---
 # ¡OJO! Esta función se ejecuta en otro hilo. No tiene acceso directo
@@ -472,6 +427,102 @@ def send_fcm_bet_status_notification_task(user_id, fcm_token, race_name, porra_n
         print(f"BACKGROUND TASK (Bet Status): Finalizado para user {user_id}, carrera '{race_name}'.")
 # --- FIN NUEVA Función ---
 
+# --- NUEVA Función para Notificación de Invitación a Porra ---
+def send_fcm_invitation_notification_task(user_id_invitado, fcm_token_invitado, porra_id, porra_name, nombre_invitador):
+    """
+    Tarea en background para enviar notificación FCM sobre una nueva invitación a porra.
+    """
+    print(f"BACKGROUND TASK (Porra Invitation): Iniciando envío FCM para user {user_id_invitado} para unirse a '{porra_name}' invitado por {nombre_invitador}...")
+
+    try:
+        # --- INICIO: Verificación/Inicialización Firebase (Copiar bloque estándar) ---
+        # Es crucial asegurarse de que Firebase esté inicializado en el contexto del hilo de esta tarea.
+        # Usamos un nombre único para la app de Firebase en esta tarea para evitar conflictos si se llama concurrentemente.
+        task_firebase_app_name = f'firebase-task-invitation-{user_id_invitado}-{porra_id}-{datetime.now().timestamp()}'
+        
+        app_initialized = False
+        try:
+            # Intentar obtener la app si ya fue inicializada con este nombre (poco probable pero seguro)
+            firebase_admin.get_app(name=task_firebase_app_name)
+            app_initialized = True
+            print(f"BACKGROUND TASK (Porra Invitation): Firebase app '{task_firebase_app_name}' ya existe.")
+        except ValueError: # ValueError: "The default Firebase app already exists." o "No Firebase app '[name]' has been created - call Firebase Admin SDK initialize_app() first."
+            # Si no existe con ese nombre específico, intentamos inicializarla.
+            # También manejamos el caso donde la app por defecto ya existe pero queremos usar una específica.
+            pass # Continuar para intentar inicializar
+
+        if not app_initialized:
+            print(f"BACKGROUND TASK (Porra Invitation): Firebase app '{task_firebase_app_name}' no detectada. Intentando inicializar...")
+            try:
+                if os.path.exists(FIREBASE_CRED_PATH):
+                    cred_task = credentials.Certificate(FIREBASE_CRED_PATH)
+                    firebase_admin.initialize_app(cred_task, {'projectId': FIREBASE_PROJECT_ID}, name=task_firebase_app_name)
+                    print(f"BACKGROUND TASK (Porra Invitation): Firebase app '{task_firebase_app_name}' inicializada DENTRO de la tarea.")
+                else:
+                    print(f"BACKGROUND TASK ERROR (Porra Invitation): No se encontró credenciales en '{FIREBASE_CRED_PATH}'. Abortando.")
+                    return
+            except ValueError as ve: # Esto puede ocurrir si otra tarea inicializó la default mientras tanto.
+                 print(f"BACKGROUND TASK INFO (Porra Invitation): Firebase app '{task_firebase_app_name}' o la default ya fue inicializada por otro hilo: {ve}. Asumiendo que está lista.")
+                 # Si la app por defecto ya existe y es la que queremos usar, esto está bien.
+                 # Si queríamos una nombrada y falló porque otra nombrada igual ya existe, también está bien.
+                 pass
+            except Exception as init_error:
+                print(f"BACKGROUND TASK ERROR (Porra Invitation): Fallo al inicializar Firebase app '{task_firebase_app_name}': {init_error}")
+                return
+        # --- FIN: Verificación/Inicialización Firebase ---
+
+        if not fcm_token_invitado:
+            print(f"BACKGROUND TASK (Porra Invitation): No hay token FCM para user {user_id_invitado}. Abortando.")
+            return
+
+        # --- Construir Mensaje Específico ---
+        title = "👋 ¡Nueva Invitación a Porra!"
+        body = f"{nombre_invitador} te ha invitado a unirte a la porra '{porra_name}'. ¡Acepta y demuestra quién sabe más de F1!"
+        
+        message = messaging.Message(
+            notification=messaging.Notification(
+                title=title,
+                body=body
+            ),
+            data={
+                'tipo_notificacion': 'porra_invitation', # <-- NUEVO TIPO para que el frontend sepa qué hacer
+                'porra_id': str(porra_id),
+                'porra_name': porra_name,
+                'inviter_name': nombre_invitador
+                # Podrías añadir más datos si son útiles para la app al recibir la notificación
+            },
+            token=fcm_token_invitado,
+            # Opcional: Configuración Android/APNS para iconos, sonido personalizado, etc.
+            # android=messaging.AndroidConfig(notification=messaging.AndroidNotification(icon='stock_ticker_update'), priority='high'),
+            # apns=messaging.APNSConfig(payload=messaging.APNSPayload(aps=messaging.Aps(sound='default', category='INVITE_CATEGORY')))
+        )
+        print(f"BACKGROUND TASK (Porra Invitation): Mensaje construido para token ...{fcm_token_invitado[-10:]}")
+
+        # --- Envío del Mensaje ---
+        # Usar la app específica si fue inicializada, o la default si el intento de nombrada usó la default.
+        try:
+            current_app = firebase_admin.get_app(name=task_firebase_app_name)
+        except ValueError:
+            current_app = firebase_admin.get_app() # Fallback a la app por defecto
+
+        response = messaging.send(message, app=current_app)
+        print(f"--- BACKGROUND TASK SUCCESS (Porra Invitation)! MsgID: {response} ---")
+
+    except firebase_exceptions.FirebaseError as fb_error: # Errores específicos de Firebase
+        print(f"!!!!!!!! BACKGROUND TASK FIREBASE ERROR (Porra Invitation) !!!!!!!!")
+        print(f"Error: {fb_error} (Code: {getattr(fb_error, 'code', 'N/A')})")
+        if fb_error.code == 'messaging/registration-token-not-registered':
+            print(f"BACKGROUND TASK (Porra Invitation): Token {fcm_token_invitado[:10]}... no registrado. Considerar eliminarlo de la BD.")
+            # Aquí podrías llamar a una función para limpiar el token de la BD
+            # remove_invalid_fcm_tokens([fcm_token_invitado])
+    except Exception as e:
+        print(f"!!!!!!!! BACKGROUND TASK GENERAL ERROR (Porra Invitation) !!!!!!!!")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print(f"BACKGROUND TASK (Porra Invitation): Finalizado para user {user_id_invitado}, porra '{porra_name}'.")
+
+# --- FIN NUEVA Función ---
 
 # --- NUEVA Función para Notificación de Resultado Listo ---
 def send_fcm_result_notification_task(user_id, fcm_token, race_name, porra_id):
@@ -611,6 +662,195 @@ def send_fcm_next_race_notification_task(user_id, fcm_token, current_race_name, 
     finally:
         print(f"BACKGROUND TASK (Next Race Ready): Finalizado para user {user_id}, siguiente carrera '{next_race_name}'.")
 # --- FIN NUEVA Función ---
+
+# --- send_fcm_betting_closed_notification_task MODIFICADA (v2 - genérica por carrera) ---
+def send_fcm_betting_closed_notification_task(user_id, fcm_token, race_id, race_name, ano_carrera):
+    """
+    Tarea en background para enviar notificación FCM genérica cuando las apuestas para una carrera han cerrado.
+    """
+    print(f"BACKGROUND TASK (Betting Closed - Generic): User {user_id}, Carrera '{race_name}' (Año: {ano_carrera})...")
+
+    try:
+        # --- INICIO: Verificación/Inicialización Firebase (Bloque estándar) ---
+        task_firebase_app_name = f'firebase-task-bettingclosed-generic-{user_id}-{race_id}-{datetime.now().timestamp()}'
+        app_initialized = False
+        try:
+            firebase_admin.get_app(name=task_firebase_app_name)
+            app_initialized = True
+        except ValueError:
+            pass
+
+        if not app_initialized:
+            try:
+                if os.path.exists(FIREBASE_CRED_PATH):
+                    cred_task = credentials.Certificate(FIREBASE_CRED_PATH)
+                    firebase_admin.initialize_app(cred_task, {'projectId': FIREBASE_PROJECT_ID}, name=task_firebase_app_name)
+                    print(f"BACKGROUND TASK (Betting Closed - Generic): Firebase app '{task_firebase_app_name}' inicializada.")
+                else:
+                    print(f"BACKGROUND TASK ERROR (Betting Closed - Generic): Credenciales no encontradas '{FIREBASE_CRED_PATH}'.")
+                    return
+            except ValueError as ve:
+                 print(f"BACKGROUND TASK INFO (Betting Closed - Generic): Firebase app ya inicializada: {ve}.")
+                 pass 
+            except Exception as init_error:
+                print(f"BACKGROUND TASK ERROR (Betting Closed - Generic): Fallo al inicializar Firebase app '{task_firebase_app_name}': {init_error}")
+                return
+        # --- FIN: Verificación/Inicialización Firebase ---
+
+        if not fcm_token:
+            print(f"BACKGROUND TASK (Betting Closed - Generic): No hay token FCM para user {user_id}. Abortando.")
+            return
+
+        title = "🔒 ¡Apuestas Cerradas!"
+        body = f"Las apuestas para {race_name} han cerrado. ¡Ya puedes comparar con otros miembros!" # Mensaje genérico
+
+        message = messaging.Message(
+            notification=messaging.Notification(title=title, body=body),
+            data={
+                'tipo_notificacion': 'betting_closed', 
+                'race_id': str(race_id),
+                'race_name': race_name,
+                'ano_carrera': str(ano_carrera) # Añadido para posible uso en frontend
+                # Ya no se envían porra_id ni porra_name específicos
+            },
+            token=fcm_token
+        )
+        
+        try:
+            current_app = firebase_admin.get_app(name=task_firebase_app_name)
+        except ValueError:
+            current_app = firebase_admin.get_app()
+
+        response = messaging.send(message, app=current_app)
+        print(f"--- BACKGROUND TASK SUCCESS (Betting Closed - Generic)! User: {user_id}, Race: {race_name}, MsgID: {response} ---")
+
+    except firebase_exceptions.FirebaseError as fb_error:
+        print(f"!!!!!!!! BACKGROUND TASK FIREBASE ERROR (Betting Closed - Generic) !!!!!!!!")
+        print(f"User {user_id}, Token ...{fcm_token[-10:] if fcm_token else 'N/A'}. Error: {fb_error} (Code: {getattr(fb_error, 'code', 'N/A')})")
+    except Exception as e:
+        print(f"!!!!!!!! BACKGROUND TASK GENERAL ERROR (Betting Closed - Generic) !!!!!!!!")
+        print(f"User {user_id}, Token ...{fcm_token[-10:] if fcm_token else 'N/A'}.")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print(f"BACKGROUND TASK (Betting Closed - Generic): Finalizado para user {user_id}, carrera '{race_name}'.")
+# --- FIN send_fcm_betting_closed_notification_task MODIFICADA ---
+
+# --- check_betting_closed_and_notify MODIFICADA (v2 - notifica una vez por usuario/carrera) ---
+def check_betting_closed_and_notify():
+    """
+    Tarea programada para buscar carreras cuya fecha límite de apuesta acaba de pasar
+    (hace ~1 hora) y notificar UNA VEZ a los participantes para esa carrera.
+    """
+    print(f"\n--- TAREA PROGRAMADA: Iniciando check_betting_closed_and_notify ({datetime.now()}) ---")
+    conn = None
+    cur = None
+    
+    try:
+        conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        print("TAREA CIERRE: Conexión DB establecida.")
+
+        now_utc = datetime.now(timezone.utc)
+        # Ajusta esta ventana según la frecuencia del job. Si corre cada 30 min:
+        deadline_passed_since = now_utc - timedelta(hours=1, minutes=15) 
+        deadline_passed_until = now_utc - timedelta(minutes=45)     
+
+        print(f"TAREA CIERRE: Buscando carreras con fecha_limite_apuesta entre {deadline_passed_since.isoformat()} y {deadline_passed_until.isoformat()}")
+        # --- Logging Adicional para Depuración de Ventana ---
+        # print(f"TAREA CIERRE DEBUG: now_utc: {now_utc.isoformat()}")
+        # print(f"TAREA CIERRE DEBUG: Carrera de prueba manual (UTC): {(datetime(2025, 5, 22, 16, 16, 0, tzinfo=ZoneInfo('Europe/Madrid'))).astimezone(timezone.utc).isoformat()}")
+        # --- Fin Logging Adicional ---
+
+        sql_find_races = """
+            SELECT id_carrera, ano, desc_carrera, fecha_limite_apuesta
+            FROM carrera
+            WHERE fecha_limite_apuesta > %s AND fecha_limite_apuesta <= %s;
+        """
+        cur.execute(sql_find_races, (deadline_passed_since, deadline_passed_until))
+        recently_closed_races = cur.fetchall()
+        print(f"TAREA CIERRE: Encontradas {len(recently_closed_races)} carreras cuyo plazo cerró hace ~1 hora.")
+
+        if not recently_closed_races:
+            cur.close(); conn.close()
+            print("TAREA CIERRE: No hay carreras en la ventana de notificación de cierre. Finalizando.")
+            return
+
+        global thread_pool_executor
+        if thread_pool_executor is None:
+            print("!!!!!!!! TAREA CIERRE ERROR: ThreadPoolExecutor no inicializado. No se pueden enviar notificaciones. !!!!!!!!!!")
+            cur.close(); conn.close()
+            return
+
+        for race in recently_closed_races:
+            id_carrera = race['id_carrera']
+            ano_carrera = race['ano']
+            desc_carrera = race['desc_carrera']
+            print(f"\nTAREA CIERRE: Procesando carrera ID {id_carrera} ('{desc_carrera}')")
+
+            # Usuarios únicos a notificar para ESTA CARRERA y sus tokens
+            unique_users_to_notify_for_race = {} # {user_id: fcm_token}
+
+            # Obtener todos los participantes de TODAS las porras de ese año
+            # que tengan token FCM y que estén activos.
+            sql_all_participants_year_with_tokens = """
+                SELECT DISTINCT u.id_usuario, u.fcm_token
+                FROM usuario u
+                JOIN participacion pa ON u.id_usuario = pa.id_usuario
+                JOIN porra po ON pa.id_porra = po.id_porra
+                WHERE po.ano = %s
+                  AND pa.estado IN ('CREADOR', 'ACEPTADA')
+                  AND u.fcm_token IS NOT NULL AND u.fcm_token != '';
+            """
+            cur.execute(sql_all_participants_year_with_tokens, (ano_carrera,))
+            all_relevant_users_with_tokens = cur.fetchall()
+
+            if not all_relevant_users_with_tokens:
+                print(f"  TAREA CIERRE: No hay participantes con tokens para el año {ano_carrera} para la carrera '{desc_carrera}'. Saltando.")
+                continue
+            
+            print(f"  TAREA CIERRE: {len(all_relevant_users_with_tokens)} participantes potenciales con token para el año {ano_carrera}.")
+
+            for user_data in all_relevant_users_with_tokens:
+                user_id = user_data['id_usuario']
+                fcm_token = user_data['fcm_token']
+                if user_id not in unique_users_to_notify_for_race: # Asegurar unicidad
+                    unique_users_to_notify_for_race[user_id] = fcm_token
+            
+            if unique_users_to_notify_for_race:
+                print(f"  TAREA CIERRE: Enviando notificación de cierre de apuestas para '{desc_carrera}' a {len(unique_users_to_notify_for_race)} usuarios únicos.")
+                for user_id, token in unique_users_to_notify_for_race.items():
+                    try:
+                        thread_pool_executor.submit(
+                            send_fcm_betting_closed_notification_task, # La versión genérica
+                            user_id,
+                            token,
+                            id_carrera,
+                            desc_carrera,
+                            ano_carrera # Pasamos año en lugar de porra_id/porra_name
+                        )
+                    except Exception as submit_err:
+                        print(f"!!!!!!!! TAREA CIERRE ERROR SUBMIT (Generic): User {user_id}, Carrera {id_carrera}. Error: {submit_err} !!!!!!!!!!")
+            else:
+                print(f"  TAREA CIERRE: No hay usuarios únicos con tokens para notificar para la carrera '{desc_carrera}'.")
+            
+            print(f"  TAREA CIERRE: Notificaciones para carrera '{desc_carrera}' (si alguna) enviadas al executor.")
+
+    except psycopg2.Error as db_err:
+        print(f"!!!!!!!! TAREA CIERRE PROGRAMADA DB ERROR !!!!!!!!")
+        print(f"ERROR: {db_err}")
+    except Exception as e:
+        print(f"!!!!!!!! TAREA CIERRE PROGRAMADA GENERAL ERROR !!!!!!!!")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if cur is not None: cur.close()
+        if conn is not None: conn.close()
+        print(f"--- TAREA PROGRAMADA: Finalizando check_betting_closed_and_notify ({datetime.now()}) ---\n")
+
+# --- FIN check_betting_closed_and_notify MODIFICADA ---
+
+# --- FIN Nueva Función ---
 
 def send_fcm_notification_task(user_id, fcm_token, trofeo_codigo, trofeo_nombre, trofeo_desc):
     """Tarea que se ejecuta en background para enviar notificación FCM."""
@@ -1823,7 +2063,7 @@ def obtener_resultado_carrera(id_carrera):
         return jsonify({"error": "Error interno al obtener el resultado de la carrera"}), 500
 # --- FIN Endpoint GET Resultado MODIFICADO ---
 
-# --- Endpoint PUT /api/carreras/<id_carrera>/resultado (MODIFICADO v8 - Filtro estado_apuesta + usa tipo_porra) ---
+# --- Endpoint PUT /api/carreras/<id_carrera>/resultado (MODIFICADO v9 - Condición 5+ miembros para trofeos GP) ---
 @app.route('/api/carreras/<int:id_carrera>/resultado', methods=['PUT'])
 @jwt_required()
 def actualizar_resultado_carrera(id_carrera):
@@ -1975,7 +2215,7 @@ def actualizar_resultado_carrera(id_carrera):
 
         # --- 4. Bucle Principal Cálculo Puntuaciones, Trofeos, Notificaciones ---
         resultado_para_calculo = {"posiciones": posiciones_resultado_codigos, "vrapida": vrapida_piloto_input}
-        # Obtener porras del año, incluyendo TIPO PORRA
+        # Obtener porras del año, incluyendo TIPO PORRA y MEMBER_COUNT
         sql_get_porras = """
             SELECT p.id_porra, p.tipo_porra, COUNT(pa.id_usuario) as member_count
             FROM porra p
@@ -1996,9 +2236,9 @@ def actualizar_resultado_carrera(id_carrera):
 
         for porra_row in porras_del_ano:
             id_porra_actual = porra_row['id_porra']
-            tipo_porra_actual = porra_row['tipo_porra'] # <<< Obtener tipo porra
-            member_count_porra = porra_row['member_count']
-            print(f"\nDEBUG: Procesando porra {id_porra_actual} (Tipo: {tipo_porra_actual}) para carrera {id_carrera}...")
+            tipo_porra_actual = porra_row['tipo_porra']
+            member_count_porra = porra_row['member_count'] # <-- Contiene el número de miembros activos
+            print(f"\nDEBUG: Procesando porra {id_porra_actual} (Tipo: {tipo_porra_actual}, Miembros: {member_count_porra}) para carrera {id_carrera}...")
 
             # --- Obtener SOLO apuestas ACEPTADAS ---
             sql_select_apuestas = """
@@ -2009,9 +2249,8 @@ def actualizar_resultado_carrera(id_carrera):
             cur.execute(sql_select_apuestas, (id_porra_actual, id_carrera))
             lista_apuestas_db_raw = cur.fetchall()
             lista_apuestas_para_calculo = []
-            map_apuestas_usuario = {} # Para acceder rápido a la apuesta del usuario para trofeos piloto
+            map_apuestas_usuario = {}
 
-            # Parsear apuestas válidas
             for apuesta_raw in lista_apuestas_db_raw:
                  try:
                      pos_data = apuesta_raw['posiciones']
@@ -2020,91 +2259,76 @@ def actualizar_resultado_carrera(id_carrera):
                      elif isinstance(pos_data, list): apuesta_pos_list = pos_data
                      else: raise TypeError("Tipo inesperado apuesta['posiciones']")
 
-                     # Validar longitud (importante!)
                      if len(apuesta_pos_list) == expected_driver_count_for_race:
-                         apuesta_dict = {
-                             'id_usuario': apuesta_raw['id_usuario'],
-                             'posiciones': apuesta_pos_list,
-                             'vrapida': apuesta_raw['vrapida']
-                         }
+                         apuesta_dict = { 'id_usuario': apuesta_raw['id_usuario'], 'posiciones': apuesta_pos_list, 'vrapida': apuesta_raw['vrapida'] }
                          lista_apuestas_para_calculo.append(apuesta_dict)
-                         map_apuestas_usuario[apuesta_raw['id_usuario']] = apuesta_dict # Guardar para trofeos
-                     else:
-                         print(f"WARN [PUT Result]: Apuesta aceptada user {apuesta_raw['id_usuario']} en porra {id_porra_actual} omitida (longitud {len(apuesta_pos_list)} != {expected_driver_count_for_race}).")
-                 except (json.JSONDecodeError, TypeError, KeyError) as e_parse:
-                     print(f"Error procesando apuesta aceptada user {apuesta_raw.get('id_usuario')} en porra {id_porra_actual}: {e_parse}")
+                         map_apuestas_usuario[apuesta_raw['id_usuario']] = apuesta_dict
+                     else: print(f"WARN [PUT Result]: Apuesta aceptada user {apuesta_raw['id_usuario']} en porra {id_porra_actual} omitida (longitud {len(apuesta_pos_list)} != {expected_driver_count_for_race}).")
+                 except (json.JSONDecodeError, TypeError, KeyError) as e_parse: print(f"Error procesando apuesta aceptada user {apuesta_raw.get('id_usuario')} en porra {id_porra_actual}: {e_parse}")
 
-            # Calcular puntuaciones
             puntuaciones_calculadas = []
             if lista_apuestas_para_calculo:
                 puntuaciones_calculadas = calcular_puntuaciones_api(resultado_para_calculo, lista_apuestas_para_calculo)
             print(f"DEBUG: Puntuaciones calculadas porra {id_porra_actual}: {len(puntuaciones_calculadas)} regs.")
 
-            # Borrar antiguas e insertar nuevas puntuaciones
             sql_delete_puntuaciones = "DELETE FROM puntuacion WHERE id_porra = %s AND id_carrera = %s;"
             cur.execute(sql_delete_puntuaciones, (id_porra_actual, id_carrera))
 
             participants_to_notify_result = set()
-            participants_to_notify_next_race = set() # Nuevo set para la nueva notificación
+            participants_to_notify_next_race = set()
 
             if puntuaciones_calculadas:
-                 puntuaciones_calculadas.sort(key=lambda x: x.get('puntos', 0), reverse=True) # Ordenar por puntos DESC
+                 puntuaciones_calculadas.sort(key=lambda x: x.get('puntos', 0), reverse=True)
                  valores_insert_puntuaciones = []
                  current_rank = 0; last_score = -1; rank_counter = 0
-                 map_rank_usuario = {} # Para trofeos de ganar
+                 map_rank_usuario = {}
 
                  for p in puntuaciones_calculadas:
                      rank_counter += 1
                      user_id = p['id_usuario']
-                     if p['puntos'] != last_score:
-                         current_rank = rank_counter
-                         last_score = p['puntos']
+                     if p['puntos'] != last_score: current_rank = rank_counter; last_score = p['puntos']
                      valores_insert_puntuaciones.append((id_porra_actual, id_carrera, user_id, p['puntos'], ano_carrera))
-                     map_rank_usuario[user_id] = current_rank # Guardar rank para trofeos
-
-                     # Añadir a listas de notificación
+                     map_rank_usuario[user_id] = current_rank
                      if user_id not in users_notified_about_result: participants_to_notify_result.add(user_id)
                      if next_race_id is not None and user_id not in users_notified_about_next_race: participants_to_notify_next_race.add(user_id)
 
-                 # Insertar nuevas puntuaciones
                  sql_insert_puntuacion = "INSERT INTO puntuacion (id_porra, id_carrera, id_usuario, puntos, ano) VALUES (%s, %s, %s, %s, %s);"
                  cur.executemany(sql_insert_puntuacion, valores_insert_puntuaciones)
-                 num_insertadas = cur.rowcount
-                 total_puntuaciones_calculadas += num_insertadas
+                 num_insertadas = cur.rowcount; total_puntuaciones_calculadas += num_insertadas
                  print(f"DEBUG: Puntuaciones nuevas insertadas: {num_insertadas} filas")
 
-                 # --- Otorgar Trofeos Carrera ---
                  detalles_trofeo = {"ano": ano_carrera, "id_porra": id_porra_actual, "id_carrera": id_carrera}
                  trofeo_carrera_especifico = map_carrera_trofeo.get(desc_carrera)
 
                  for user_id, rank in map_rank_usuario.items():
-                     # Trofeo por ganar (si hay >= 5 miembros)
-                     if rank == 1:
-                         if member_count_porra >= 5:
+                     if rank == 1: # Usuario ha ganado la carrera (o empatado en primer puesto)
+                         # Trofeo por ganar CUALQUIER carrera (si hay >= 5 miembros)
+                         if member_count_porra >= 5: # <--- CONDICIÓN YA EXISTENTE Y CORRECTA
                              _award_trophy(user_id, 'GANA_CARRERA_CUALQUIERA', conn, cur, detalles=detalles_trofeo)
-                         # Trofeo específico de la carrera
-                         if trofeo_carrera_especifico:
+                         
+                         # Trofeo específico de la carrera (ej: GANA_AUSTRALIA)
+                         # ----> INICIO DE LA CORRECCIÓN <----
+                         if trofeo_carrera_especifico and member_count_porra >= 5: # <--- AÑADIR CONDICIÓN DE MIEMBROS
+                         # ----> FIN DE LA CORRECCIÓN <----
                              _award_trophy(user_id, trofeo_carrera_especifico, conn, cur, detalles=detalles_trofeo)
-                         # Trofeo por ganar en porra pública
-                         if tipo_porra_actual == 'PUBLICA': # <<< Usar tipo_porra
+                         
+                         # Trofeo por ganar en porra pública (NO requiere 5+ miembros según descripción)
+                         if tipo_porra_actual == 'PUBLICA':
                              _award_trophy(user_id, 'GANA_CARRERA_PUBLICA', conn, cur, detalles=detalles_trofeo)
 
                      # Trofeos por acertar piloto (si hay >= 5 miembros)
-                     if member_count_porra >= 5:
-                         apuesta_usuario = map_apuestas_usuario.get(user_id) # Obtener la apuesta PARSEADA
+                     if member_count_porra >= 5: # <--- CONDICIÓN YA EXISTENTE Y CORRECTA PARA ESTE BLOQUE
+                         apuesta_usuario = map_apuestas_usuario.get(user_id)
                          if apuesta_usuario:
                              apuesta_pos_list = apuesta_usuario.get('posiciones', [])
                              for piloto_code, trofeo_code in map_piloto_trofeo.items():
-                                 pos_real_idx = posiciones_resultado_map.get(piloto_code) # Índice real (0 a N-1)
-                                 # Verificar que el piloto acabó, que su posición está dentro de la apuesta y que coincide
+                                 pos_real_idx = posiciones_resultado_map.get(piloto_code)
                                  if pos_real_idx is not None and \
                                     pos_real_idx < len(apuesta_pos_list) and \
                                     apuesta_pos_list[pos_real_idx] == piloto_code:
                                       detalles_piloto = {**detalles_trofeo, "piloto": piloto_code}
                                       _award_trophy(user_id, trofeo_code, conn, cur, detalles=detalles_piloto)
-                 # --- Fin Otorgar Trofeos Carrera ---
             else:
-                 # Si no hubo apuestas aceptadas (o ninguna apuesta), notificar a todos los participantes igualmente
                  print(f"DEBUG: No se calcularon/insertaron puntuaciones para porra {id_porra_actual}. Obteniendo participantes para notificación.")
                  cur.execute("SELECT id_usuario FROM participacion WHERE id_porra = %s AND estado IN ('CREADOR', 'ACEPTADA');", (id_porra_actual,))
                  all_participants = cur.fetchall()
@@ -2113,7 +2337,7 @@ def actualizar_resultado_carrera(id_carrera):
                      if user_id not in users_notified_about_result: participants_to_notify_result.add(user_id)
                      if next_race_id is not None and user_id not in users_notified_about_next_race: participants_to_notify_next_race.add(user_id)
 
-            # --- Notificación Resultado Listo (sin cambios aquí) ---
+            # --- Notificación Resultado Listo ---
             if participants_to_notify_result:
                  user_ids_to_notify_list_res = list(participants_to_notify_result)
                  placeholders_res = ','.join(['%s'] * len(user_ids_to_notify_list_res))
@@ -2134,7 +2358,7 @@ def actualizar_resultado_carrera(id_carrera):
                         print(f"DEBUG: Enviadas {submitted_count_res} tareas de notificación de resultado al executor para porra {id_porra_actual}.")
                  else: print(f"DEBUG: No se encontraron tokens FCM válidos para notificar resultado en porra {id_porra_actual}.")
 
-            # --- Notificación Próxima Carrera Disponible (sin cambios aquí) ---
+            # --- Notificación Próxima Carrera Disponible ---
             if next_race_id is not None and participants_to_notify_next_race:
                 print(f"DEBUG: Preparando notificación 'Next Race Available' para carrera '{next_race_name}' (ID: {next_race_id}).")
                 user_ids_to_notify_list_next = list(participants_to_notify_next_race)
@@ -2166,10 +2390,10 @@ def actualizar_resultado_carrera(id_carrera):
 
         if is_season_finished:
              print(f"INFO: Temporada {ano_carrera} finalizada. Comprobando trofeos de temporada...")
-             for porra_row in porras_del_ano: # Re-iterar porras para trofeos fin de temporada
+             for porra_row in porras_del_ano:
                  id_porra_actual = porra_row['id_porra']
-                 tipo_porra_actual = porra_row['tipo_porra'] # <<< Obtener tipo porra
-                 member_count_porra = porra_row['member_count']
+                 tipo_porra_actual = porra_row['tipo_porra']
+                 member_count_porra = porra_row['member_count'] # <-- Re-acceder al recuento de miembros
                  detalles_temporada = {"ano": ano_carrera, "id_porra": id_porra_actual}
 
                  # Trofeo Campeón Temporada
@@ -2184,33 +2408,26 @@ def actualizar_resultado_carrera(id_carrera):
                             winner_user_id = clasif_row['id_usuario']
                             if winner_user_id not in processed_winners:
                                 # Trofeo campeón estándar (si >= 5 miembros)
-                                if member_count_porra >= 5:
+                                if member_count_porra >= 5: # <--- CONDICIÓN YA EXISTENTE Y CORRECTA
                                     _award_trophy(winner_user_id, 'CAMPEON_TEMPORADA', conn, cur, detalles=detalles_temporada)
-                                # Trofeo campeón público
-                                if tipo_porra_actual == 'PUBLICA': # <<< Usar tipo_porra
+                                # Trofeo campeón público (NO requiere 5+ miembros según descripción)
+                                if tipo_porra_actual == 'PUBLICA':
                                     _award_trophy(winner_user_id, 'CAMPEON_TEMPORADA_PUBLICA', conn, cur, detalles=detalles_temporada)
                                 processed_winners.add(winner_user_id)
-                         else: break # Dejar de procesar si la puntuación baja
+                         else: break 
 
-                 # Trofeo Aplicado (participar en todas las carreras)
+                 # Trofeo Aplicado (participar en todas las carreras - NO requiere 5+ miembros)
                  cur.execute("SELECT id_usuario FROM participacion WHERE id_porra = %s AND estado IN ('CREADOR', 'ACEPTADA');", (id_porra_actual,))
                  participantes = cur.fetchall()
                  for participante in participantes:
                      user_id_part = participante['id_usuario']
-                     # Contar carreras en las que el usuario tiene apuesta ACEPTADA
-                     sql_count_bets = """
-                         SELECT COUNT(DISTINCT a.id_carrera)
-                         FROM apuesta a
-                         JOIN carrera c ON a.id_carrera = c.id_carrera
-                         WHERE a.id_usuario = %s AND a.id_porra = %s AND c.ano = %s AND a.estado_apuesta = 'ACEPTADA';
-                         """
+                     sql_count_bets = "SELECT COUNT(DISTINCT a.id_carrera) FROM apuesta a JOIN carrera c ON a.id_carrera = c.id_carrera WHERE a.id_usuario = %s AND a.id_porra = %s AND c.ano = %s AND a.estado_apuesta = 'ACEPTADA';"
                      cur.execute(sql_count_bets, (user_id_part, id_porra_actual, ano_carrera))
                      bets_count_user = cur.fetchone()[0]
                      if bets_count_user >= total_races_year:
                          _award_trophy(user_id_part, 'APLICADO', conn, cur, detalles=detalles_temporada)
         # --- Fin comprobación fin temporada ---
 
-        # Commit y respuesta final
         conn.commit()
         cur.close()
         return jsonify({"mensaje": f"Resultado detallado y detalles piloto carrera {id_carrera} guardados.", "puntuaciones_calculadas_totales": total_puntuaciones_calculadas, "fin_temporada_comprobado": is_season_finished}), 200
@@ -2653,44 +2870,44 @@ def listar_miembros_porra(id_porra):
 # --- Fin del endpoint modificado en mi_api.py ---
 
 
-# --- NUEVO Endpoint POST /api/porras/<id_porra>/invitaciones (Protegido con JWT) ---
-# --- Endpoint POST /api/porras/<id_porra>/invitaciones (MODIFICADO para usar Nombre Usuario) ---
+# --- Endpoint POST /api/porras/<id_porra>/invitaciones (MODIFICADO para Notificación FCM) ---
 @app.route('/api/porras/<int:id_porra>/invitaciones', methods=['POST'])
 @jwt_required() # Requiere token
 def invitar_usuario_porra(id_porra):
-    id_usuario_actual = get_jwt_identity()
+    id_usuario_actual_str = get_jwt_identity() # ID del creador (string)
+    current_user_claims = get_jwt() # Obtener todos los claims del token
+    nombre_invitador = current_user_claims.get("nombre_usuario", "El creador de la porra") # Nombre del creador
 
     if not request.is_json:
         return jsonify({"error": "La solicitud debe ser JSON"}), 400
 
     data = request.get_json()
-    # --- <<< CAMBIO: Esperar nombre en lugar de email >>> ---
-    nombre_invitado_req = data.get('nombre_invitado') # Espera 'nombre_invitado'
+    nombre_invitado_req = data.get('nombre_invitado')
 
-    # Validación básica del nombre
     if not nombre_invitado_req or not isinstance(nombre_invitado_req, str) or len(nombre_invitado_req.strip()) == 0:
         return jsonify({"error": "Falta 'nombre_invitado' o es inválido"}), 400
-    # --- <<< FIN CAMBIO >>> ---
-
-    nombre_invitado = nombre_invitado_req.strip() # Limpiar espacios
+    
+    nombre_invitado = nombre_invitado_req.strip()
 
     conn = None
+    cur = None # Declarar cur aquí para poder cerrarlo en finally
     try:
         conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
         # 1. Verificar que la porra existe y que el usuario actual es el creador
-        cur.execute("SELECT id_creador, nombre_porra FROM porra WHERE id_porra = %s;", (id_porra,)) # Obtener nombre porra también
+        cur.execute("SELECT id_creador, nombre_porra FROM porra WHERE id_porra = %s;", (id_porra,))
         porra_info = cur.fetchone()
         if not porra_info:
             return jsonify({"error": f"Porra con id {id_porra} no encontrada"}), 404
 
-        # Autorización (comparar IDs como enteros)
         id_db_creator = porra_info['id_creador']
+        nombre_porra_actual = porra_info['nombre_porra'] # Nombre de la porra
+        
         try:
-            id_token_int = int(id_usuario_actual)
+            id_token_int = int(id_usuario_actual_str)
         except (ValueError, TypeError):
-            print(f"ERROR: Identidad de token inválida para convertir a int: {id_usuario_actual}")
+            print(f"ERROR: Identidad de token inválida para convertir a int: {id_usuario_actual_str}")
             cur.close(); conn.close()
             return jsonify({"error": "Error interno de autorización"}), 500
 
@@ -2698,44 +2915,58 @@ def invitar_usuario_porra(id_porra):
              cur.close(); conn.close()
              return jsonify({"error": "Solo el creador puede enviar invitaciones para esta porra"}), 403
 
-        # --- <<< CAMBIO: Buscar usuario por nombre >>> ---
-        # 2. Buscar al usuario invitado por NOMBRE
-        cur.execute("SELECT id_usuario, nombre FROM usuario WHERE nombre = %s;", (nombre_invitado,))
-        usuario_invitado = cur.fetchone()
+        # 2. Buscar al usuario invitado por NOMBRE y obtener su fcm_token
+        cur.execute("SELECT id_usuario, nombre, fcm_token FROM usuario WHERE nombre = %s;", (nombre_invitado,))
+        usuario_invitado_data = cur.fetchone()
 
-        if not usuario_invitado:
-            # Mensaje de error actualizado
+        if not usuario_invitado_data:
             return jsonify({"error": f"Usuario con nombre '{nombre_invitado}' no encontrado"}), 404
-        # --- <<< FIN CAMBIO >>> ---
 
-        id_usuario_invitado = usuario_invitado['id_usuario']
-        # Usamos el nombre encontrado en la BD para el mensaje (puede diferir en mayúsculas/minúsculas si la BD no es sensible)
-        nombre_usuario_confirmado = usuario_invitado['nombre']
+        id_usuario_invitado = usuario_invitado_data['id_usuario']
+        nombre_usuario_invitado_confirmado = usuario_invitado_data['nombre']
+        fcm_token_invitado = usuario_invitado_data.get('fcm_token') # Puede ser None
 
         # 3. Validaciones adicionales
-        # a) No invitarse a sí mismo (comparando IDs enteros)
         if id_usuario_invitado == id_token_int:
              return jsonify({"error": "No puedes invitarte a ti mismo"}), 400
 
-        # b) Verificar si ya existe participación/invitación
         cur.execute("SELECT estado FROM participacion WHERE id_porra = %s AND id_usuario = %s;", (id_porra, id_usuario_invitado))
         participacion_existente = cur.fetchone()
         if participacion_existente:
             estado_actual = participacion_existente['estado']
             if estado_actual in ['CREADOR', 'ACEPTADA']:
-                return jsonify({"error": f"El usuario '{nombre_usuario_confirmado}' ya es miembro de esta porra"}), 409
+                return jsonify({"error": f"El usuario '{nombre_usuario_invitado_confirmado}' ya es miembro de esta porra"}), 409
             elif estado_actual == 'PENDIENTE':
-                 return jsonify({"error": f"El usuario '{nombre_usuario_confirmado}' ya tiene una invitación pendiente para esta porra"}), 409
+                 return jsonify({"error": f"El usuario '{nombre_usuario_invitado_confirmado}' ya tiene una invitación pendiente para esta porra"}), 409
 
         # 4. Insertar la Invitación
         sql_insert = "INSERT INTO participacion (id_porra, id_usuario, estado) VALUES (%s, %s, %s);"
         cur.execute(sql_insert, (id_porra, id_usuario_invitado, 'PENDIENTE'))
 
+        # --- 5. Enviar Notificación FCM ---
+        if fcm_token_invitado:
+            print(f"DEBUG [Invitar Usuario]: Intentando enviar notificación de invitación a user {id_usuario_invitado} (Token: ...{fcm_token_invitado[-10:] if fcm_token_invitado else 'N/A'})...")
+            global thread_pool_executor
+            if thread_pool_executor:
+                thread_pool_executor.submit(
+                    send_fcm_invitation_notification_task,
+                    id_usuario_invitado,
+                    fcm_token_invitado,
+                    id_porra,
+                    nombre_porra_actual,
+                    nombre_invitador # Nombre del usuario que hace la invitación (creador)
+                )
+                print(f"DEBUG [Invitar Usuario]: Tarea de notificación de invitación FCM enviada al executor.")
+            else:
+                print("WARN [Invitar Usuario]: ThreadPoolExecutor no disponible, no se pudo enviar tarea FCM para invitación.")
+        else:
+            print(f"DEBUG [Invitar Usuario]: No se envía notificación de invitación (token FCM del invitado es nulo o vacío) para user {id_usuario_invitado}.")
+        # --- Fin Enviar Notificación FCM ---
+
         conn.commit()
         cur.close()
 
-        # Mensaje de éxito actualizado
-        return jsonify({"mensaje": f"Invitación enviada correctamente al usuario '{nombre_usuario_confirmado}' para la porra '{porra_info['nombre_porra']}'"}), 201
+        return jsonify({"mensaje": f"Invitación enviada correctamente al usuario '{nombre_usuario_invitado_confirmado}' para la porra '{nombre_porra_actual}'"}), 201
 
     except psycopg2.Error as db_error:
         print(f"Error de base de datos en invitar_usuario_porra: {db_error}")
@@ -2743,11 +2974,13 @@ def invitar_usuario_porra(id_porra):
         return jsonify({"error": "Error de base de datos al enviar la invitación"}), 500
     except Exception as error:
         print(f"Error inesperado en invitar_usuario_porra: {error}")
+        import traceback
+        traceback.print_exc()
         if conn: conn.rollback()
         return jsonify({"error": "Error interno al enviar la invitación"}), 500
     finally:
-        if conn is not None and not conn.closed:
-            conn.close()
+        if cur is not None and not cur.closed: cur.close()
+        if conn is not None and not conn.closed: conn.close()
 # --- Fin endpoint MODIFICADO ---
 # --- NUEVO Endpoint POST /api/participaciones/<id_participacion>/respuesta (Protegido con JWT) ---
 # Permite al usuario autenticado aceptar o rechazar una invitación PENDIENTE dirigida a él.
@@ -4492,6 +4725,16 @@ try:
         name='Check race deadlines and notify users',        # Nombre descriptivo
         replace_existing=True                                # Reemplaza si ya existe (útil en reinicios)
     )
+
+    # --- AÑADIR NUEVA TAREA PROGRAMADA PARA CIERRE DE APUESTAS ---
+    scheduler.add_job(
+        func=check_betting_closed_and_notify,       # La nueva función a ejecutar
+        trigger=IntervalTrigger(minutes=1),        # Ejecutar cada 30 minutos (ajustar según necesidad)
+        id='betting_closed_check_job',              # ID único para esta nueva tarea
+        name='Check betting closed and notify users', # Nombre descriptivo
+        replace_existing=True                       # Reemplaza si ya existe
+    )
+    # --- FIN AÑADIR NUEVA TAREA ---
 
     print("SCHEDULER: Intentando iniciar el scheduler...")
     scheduler.start()
