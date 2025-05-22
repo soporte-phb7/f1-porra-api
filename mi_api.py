@@ -4729,7 +4729,7 @@ try:
     # --- AÑADIR NUEVA TAREA PROGRAMADA PARA CIERRE DE APUESTAS ---
     scheduler.add_job(
         func=check_betting_closed_and_notify,       # La nueva función a ejecutar
-        trigger=IntervalTrigger(minutes=1),        # Ejecutar cada 30 minutos (ajustar según necesidad)
+        trigger=IntervalTrigger(minutes=30),        # Ejecutar cada 30 minutos (ajustar según necesidad)
         id='betting_closed_check_job',              # ID único para esta nueva tarea
         name='Check betting closed and notify users', # Nombre descriptivo
         replace_existing=True                       # Reemplaza si ya existe
