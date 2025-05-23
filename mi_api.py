@@ -4711,71 +4711,81 @@ def responder_apuesta_pendiente(id_apuesta):
         if conn is not None and not conn.closed: conn.close()
 # --- FIN Endpoint POST Respuesta Apuesta MODIFICADO ---
 
-try:
-    # Crear instancia del Scheduler de APScheduler
-    scheduler = BackgroundScheduler(daemon=True, timezone=str(ZoneInfo("Europe/Madrid"))) # O pytz si usas esa
+# Inicializa la variable scheduler globalmente para que atexit pueda accederla
+scheduler = None
 
-    # Añadir la tarea principal que comprueba las fechas límite
-    scheduler.add_job(
-        func=check_deadlines_and_notify,                     # La función a ejecutar
-        trigger=IntervalTrigger(hours=1),                   # <<< AJUSTA EL INTERVALO AQUÍ (ej: hours=1 para cada hora)
-                                                              #     Para pruebas puedes usar minutes=5 o seconds=30,
-                                                              #     pero recuerda cambiarlo para producción.
-        id='deadline_check_job',                             # ID único
-        name='Check race deadlines and notify users',        # Nombre descriptivo
-        replace_existing=True                                # Reemplaza si ya existe (útil en reinicios)
-    )
+# --- CONDITIONAL SCHEDULER START ---
+if os.environ.get('RUN_SCHEDULER', 'false').lower() == 'true':
+    print("INFO: RUN_SCHEDULER está activado. Iniciando APScheduler...")
+    try:
+        # Crear instancia del Scheduler de APScheduler
+        # Necesitas tener ZoneInfo importado y configurado como lo tienes
+        # from zoneinfo import ZoneInfo
+        # o from pytz import timezone as ZoneInfo
 
-    # --- AÑADIR NUEVA TAREA PROGRAMADA PARA CIERRE DE APUESTAS ---
-    scheduler.add_job(
-        func=check_betting_closed_and_notify,       # La nueva función a ejecutar
-        trigger=IntervalTrigger(minutes=30),        # Ejecutar cada 30 minutos (ajustar según necesidad)
-        id='betting_closed_check_job',              # ID único para esta nueva tarea
-        name='Check betting closed and notify users', # Nombre descriptivo
-        replace_existing=True                       # Reemplaza si ya existe
-    )
-    # --- FIN AÑADIR NUEVA TAREA ---
+        scheduler = BackgroundScheduler(daemon=True, timezone=str(ZoneInfo("Europe/Madrid")))
 
-    print("SCHEDULER: Intentando iniciar el scheduler...")
-    scheduler.start()
-    print("SCHEDULER: Scheduler iniciado correctamente.")
+        scheduler.add_job(
+            func=check_deadlines_and_notify,
+            trigger=IntervalTrigger(hours=1), # O tu intervalo deseado
+            id='deadline_check_job',
+            name='Check race deadlines and notify users',
+            replace_existing=True
+        )
 
-    # --- Registrar función de apagado ordenado ---
-    # Define una función que se llamará cuando la aplicación termine
-    def shutdown_gracefully():
-        print("SHUTDOWN: Iniciando apagado ordenado...")
-        # 1. Apagar el pool de hilos, esperando a que las tareas en curso terminen (wait=True)
+        scheduler.add_job(
+            func=check_betting_closed_and_notify,
+            trigger=IntervalTrigger(minutes=30), # O tu intervalo deseado
+            id='betting_closed_check_job',
+            name='Check betting closed and notify users',
+            replace_existing=True
+        )
+
+        print("SCHEDULER: Intentando iniciar el scheduler...")
+        scheduler.start()
+        print("SCHEDULER: Scheduler iniciado correctamente.")
+
+    except Exception as e:
+        print(f"!!!!!!!! SCHEDULER/EXECUTOR: ERROR CRÍTICO AL INICIAR !!!!!!!!")
+        print(f"Error: {e}")
+        scheduler = None # Asegurar que scheduler es None si falla el inicio
+else:
+    print("INFO: RUN_SCHEDULER no está activado. El APScheduler no se iniciará en esta instancia.")
+# --- FIN CONDITIONAL SCHEDULER START ---
+
+
+# --- Función de apagado (modificada para manejar scheduler condicional) ---
+def shutdown_gracefully():
+    print("SHUTDOWN: Iniciando apagado ordenado...")
+    global thread_pool_executor # Acceder al executor global
+    global scheduler # Acceder al scheduler global
+
+    # 1. Apagar el pool de hilos
+    if 'thread_pool_executor' in globals() and thread_pool_executor is not None:
         print("SHUTDOWN: Apagando ThreadPoolExecutor (esperando tareas)...")
         thread_pool_executor.shutdown(wait=True)
         print("SHUTDOWN: ThreadPoolExecutor apagado.")
-        # 2. Apagar el scheduler
+    else:
+        print("SHUTDOWN: ThreadPoolExecutor no fue inicializado o ya fue apagado.")
+
+    # 2. Apagar el scheduler SI FUE INICIALIZADO Y ESTÁ CORRIENDO
+    if scheduler is not None and scheduler.running:
         print("SHUTDOWN: Apagando Scheduler...")
         scheduler.shutdown()
         print("SHUTDOWN: Scheduler apagado.")
-        print("SHUTDOWN: Apagado completado.")
+    else:
+        print("SHUTDOWN: Scheduler no estaba iniciado o ya fue apagado.")
+    print("SHUTDOWN: Apagado completado.")
 
-    # Registrar la función para que se ejecute al salir del script Python
+# Registrar la función para que se ejecute al salir
+if 'atexit' in globals(): # Comprobar si atexit fue importado
     atexit.register(shutdown_gracefully)
     print("SHUTDOWN: Función de apagado (Scheduler y ThreadPoolExecutor) registrada con atexit.")
-    # --- FIN Registro Apagado ---
+# --- FIN Función de apagado ---
 
-except Exception as e:
-    # Captura cualquier error durante la inicialización o arranque del scheduler
-    print(f"!!!!!!!! SCHEDULER/EXECUTOR: ERROR CRÍTICO AL INICIAR !!!!!!!!")
-    print(f"Error: {e}")
-    # raise e
-# --- FIN Scheduler Setup (Versión Simplificada) ---
 
-# --- FIN Scheduler Setup ---
+# ... (el resto de tus endpoints y la lógica de la API) ...
 
-# ... (tu código existente para app.run(), si lo tienes al final) ...
-# Ejemplo:
 # if __name__ == '__main__':
-#     # Importante: use_reloader=False es más simple si tienes problemas con el scheduler y el reloader
-#     app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
-
-# --- Punto de entrada para ejecutar la API (cuando corres python mi_api.py) ---
-#if __name__ == '__main__':
-    # Ejecuta la app Flask en modo debug (se reinicia con cambios, muestra más errores)
-    # Accede desde tu navegador a http://127.0.0.1:5000/api/
-#    app.run(debug=True)
+#     # Considera usar use_reloader=False si el scheduler se inicia aquí y tienes problemas
+#     app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000), debug=False, use_reloader=False)
