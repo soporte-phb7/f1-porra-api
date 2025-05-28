@@ -108,12 +108,16 @@ jwt = JWTManager(app) # Inicializa JWTManager con tu app
 # Para probar localmente, puedes definirlas temporalmente o crear un archivo .env
 app.config["JWT_SECRET_KEY"] = os.environ.get('JWT_SECRET_KEY', 'cambiar-esta-clave-secreta-ya!')
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(days=14)
-app.config['MAIL_PASSWORD'] = os.environ.get('SENDGRID_API_KEY') # ¡Obligatorio!
-app.config['MAIL_DEFAULT_SENDER'] = os.environ.get('MAIL_SENDER') # ¡Obligatorio!
-app.config['MAIL_SERVER'] = 'smtp.sendgrid.net'
-app.config['MAIL_PORT'] = 587
+# Configuración para Gmail
+app.config['MAIL_SERVER'] = 'smtp.gmail.com'
+app.config['MAIL_PORT'] = 587 # Puerto para TLS
 app.config['MAIL_USE_TLS'] = True
-app.config['MAIL_USERNAME'] = 'apikey'
+app.config['MAIL_USE_SSL'] = False # No usar SSL si se usa TLS en el puerto 587
+# ¡IMPORTANTE! Usa variables de entorno para tu email y contraseña de aplicación
+app.config['MAIL_USERNAME'] = os.environ.get('GMAIL_USER') # Ejemplo: tuemail@gmail.com
+app.config['MAIL_PASSWORD'] = os.environ.get('GMAIL_APP_PASSWORD') # La contraseña de aplicación de 16 caracteres que generaste
+app.config['MAIL_DEFAULT_SENDER'] = os.environ.get('GMAIL_USER') # O "Nombre App <tuemail@gmail.com>"
+
 
 
 mail = Mail(app) # Inicializa Flask-Mail con tu app
