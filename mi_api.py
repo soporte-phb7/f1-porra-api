@@ -1427,10 +1427,11 @@ Saludos,\nEl equipo de F1 Porra App"""
         if conn is not None and not conn.closed:
             conn.close()
 
-# --- Endpoint POST /api/porras/<id_porra>/apuestas (MODIFICADO v7 - Lógica Estado Apuesta Mejorada) ---
-@app.route('/api/porras/<int:id_porra>/apuestas', methods=['POST'])
+# Función para registrar o actualizar un pronóstico (antes apuesta)
+# URL MODIFICADA: /api/porras/<id_porra>/forecasts
+@app.route('/api/porras/<int:id_porra>/forecasts', methods=['POST'])
 @jwt_required()
-def registrar_o_actualizar_apuesta(id_porra):
+def registrar_o_actualizar_pronostico(id_porra):
     id_usuario_actual = get_jwt_identity() # ID String
 
     # --- Validaciones básicas input (sin cambios) ---
@@ -1454,22 +1455,18 @@ def registrar_o_actualizar_apuesta(id_porra):
         except (ValueError, TypeError): return jsonify({"error": "Error interno autorización."}), 500
 
         # --- Validaciones Previas ---
-        # Porra existe y OBTENER TIPO PORRA? (sin cambios)
         cur.execute("SELECT ano, tipo_porra FROM porra WHERE id_porra = %s;", (id_porra,))
         porra_info = cur.fetchone()
-        if porra_info is None: return jsonify({"error": "Porra no encontrada"}), 404
+        if porra_info is None: return jsonify({"error": "Grupo no encontrado"}), 404
         tipo_porra_actual = porra_info['tipo_porra']
 
-        # Carrera existe y obtener año y fecha límite? (sin cambios)
         cur.execute("SELECT ano, fecha_limite_apuesta FROM carrera WHERE id_carrera = %s;", (id_carrera,))
         carrera_info = cur.fetchone()
         if carrera_info is None: return jsonify({"error": "Carrera no encontrada"}), 404
         ano_carrera = carrera_info['ano']
         fecha_limite_db = carrera_info['fecha_limite_apuesta']
 
-        # Validación Pilotos Activos por Carrera (sin cambios)
-        # ... (código idéntico para obtener active_drivers_for_race y expected_driver_count_for_race) ...
-        # ... (validaciones de longitud y códigos de pilotos_input y vrapida contra active_drivers_for_race) ...
+        # Validación Pilotos Activos por Carrera
         active_drivers_for_race = set()
         expected_driver_count_for_race = 0
         sql_race_drivers = "SELECT codigo_piloto FROM piloto_carrera_detalle WHERE id_carrera = %s AND activo_para_apuesta = TRUE;"
@@ -1486,119 +1483,81 @@ def registrar_o_actualizar_apuesta(id_porra):
         if not all(p_code in active_drivers_for_race for p_code in posiciones_input): invalid_codes = [p for p in posiciones_input if p not in active_drivers_for_race]; return jsonify({"error": f"Códigos de piloto inválidos/inactivos en posiciones: {invalid_codes}"}), 400
         if vrapida not in active_drivers_for_race: return jsonify({"error": f"Piloto de vuelta rápida '{vrapida}' inválido/inactivo."}), 400
 
-        # Membresía (sin cambios)
         sql_check_membership = "SELECT 1 FROM participacion WHERE id_porra = %s AND id_usuario = %s AND estado IN ('CREADOR', 'ACEPTADA');"
         cur.execute(sql_check_membership, (id_porra, id_usuario_actual_int))
         if cur.fetchone() is None: return jsonify({"error": "No eres miembro activo."}), 403
 
-        # Fecha Límite (sin cambios)
         if fecha_limite_db is None: return jsonify({"error": "Fecha límite no definida."}), 409
         try: from zoneinfo import ZoneInfo
         except ImportError: from pytz import timezone as ZoneInfo
         try: tz_madrid = ZoneInfo("Europe/Madrid")
         except Exception: tz_madrid = timezone.utc
         now_local = datetime.now(tz_madrid)
-        # Asegurar que ambas fechas tienen timezone para comparar
         if fecha_limite_db.tzinfo is None: fecha_limite_db = fecha_limite_db.replace(tzinfo=timezone.utc)
         if now_local.tzinfo is None: now_local = now_local.replace(tzinfo=timezone.utc)
         if now_local.astimezone(timezone.utc) > fecha_limite_db.astimezone(timezone.utc): return jsonify({"error": "Fecha límite pasada."}), 409
 
-        # --- >>> NUEVA Lógica de Estado Apuesta <<< ---
-        estado_final_apuesta = 'PENDIENTE' # Valor por defecto para administrada
-        fecha_estado_final = None # Fecha aceptación/rechazo (se pone al responder)
-        now_utc_db = datetime.now(timezone.utc) # Momento actual para fecha_modificacion
+        # --- Lógica de Estado (apuesta -> pronostico) ---
+        estado_final_pronostico = 'PENDIENTE'
+        fecha_estado_final = None
+        now_utc_db = datetime.now(timezone.utc)
 
-        # 1. Comprobar si existe apuesta previa para este usuario/carrera/porra
         cur.execute("SELECT estado_apuesta FROM apuesta WHERE id_porra = %s AND id_carrera = %s AND id_usuario = %s;",
                     (id_porra, id_carrera, id_usuario_actual_int))
-        apuesta_previa = cur.fetchone()
+        pronostico_previo = cur.fetchone()
 
-        # 2. Determinar estado final
         if tipo_porra_actual in ['PUBLICA', 'PRIVADA_AMISTOSA']:
-            estado_final_apuesta = 'ACEPTADA'
-            fecha_estado_final = now_utc_db # Se acepta automáticamente
+            estado_final_pronostico = 'ACEPTADA'
+            fecha_estado_final = now_utc_db
         elif tipo_porra_actual == 'PRIVADA_ADMINISTRADA':
-            if apuesta_previa:
-                # Si había apuesta previa en porra administrada...
-                estado_previo = apuesta_previa['estado_apuesta']
-                if estado_previo == 'ACEPTADA':
-                    # Si estaba ACEPTADA, la modificación la MANTIENE ACEPTADA
-                    estado_final_apuesta = 'ACEPTADA'
-                    fecha_estado_final = now_utc_db # Actualizamos fecha de estado (o podríamos mantener la original?)
-                                                  # -> Actualizarla parece más lógico para indicar que se tocó
-                elif estado_previo == 'RECHAZADA':
-                    # Si estaba RECHAZADA, la modificación la vuelve a poner PENDIENTE
-                    estado_final_apuesta = 'PENDIENTE'
-                    fecha_estado_final = None # El creador debe volver a decidir
-                else: # PENDIENTE (o estado inesperado)
-                    # Si estaba PENDIENTE, sigue PENDIENTE
-                    estado_final_apuesta = 'PENDIENTE'
-                    fecha_estado_final = None
+            if pronostico_previo:
+                estado_previo = pronostico_previo['estado_apuesta']
+                if estado_previo == 'ACEPTADA': estado_final_pronostico = 'ACEPTADA'; fecha_estado_final = now_utc_db
+                elif estado_previo == 'RECHAZADA': estado_final_pronostico = 'PENDIENTE'; fecha_estado_final = None
+                else: estado_final_pronostico = 'PENDIENTE'; fecha_estado_final = None
             else:
-                # Si no había apuesta previa (es la primera vez), queda PENDIENTE
-                estado_final_apuesta = 'PENDIENTE'
-                fecha_estado_final = None
-        # --- >>> FIN NUEVA Lógica de Estado Apuesta <<< ---
-
-
-        # Lógica Trofeo Primera Apuesta (sin cambios)
+                estado_final_pronostico = 'PENDIENTE'; fecha_estado_final = None
+        
         should_award_first_bet_trophy = False
         cur.execute("SELECT COUNT(*) FROM apuesta WHERE id_usuario = %s;", (id_usuario_actual_int,))
-        if cur.fetchone()[0] == 0 and not apuesta_previa : # Solo si realmente no tenía NINGUNA apuesta antes
+        if cur.fetchone()[0] == 0 and not pronostico_previo:
             should_award_first_bet_trophy = True
 
-
-        # --- Modificaciones BD (Upsert con manejo de estado) ---
         sql_upsert = """
             INSERT INTO apuesta (id_porra, id_carrera, id_usuario, posiciones, vrapida, estado_apuesta, fecha_estado_apuesta, fecha_modificacion)
             VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s)
             ON CONFLICT (id_porra, id_carrera, id_usuario) DO UPDATE SET
-                posiciones = EXCLUDED.posiciones,
-                vrapida = EXCLUDED.vrapida,
-                estado_apuesta = EXCLUDED.estado_apuesta,
-                fecha_estado_apuesta = EXCLUDED.fecha_estado_apuesta,
+                posiciones = EXCLUDED.posiciones, vrapida = EXCLUDED.vrapida,
+                estado_apuesta = EXCLUDED.estado_apuesta, fecha_estado_apuesta = EXCLUDED.fecha_estado_apuesta,
                 fecha_modificacion = EXCLUDED.fecha_modificacion;
             """
         posiciones_json = json.dumps(posiciones_input)
-        valores = (
-            id_porra, id_carrera, id_usuario_actual_int,
-            posiciones_json, vrapida,
-            estado_final_apuesta,       # Estado calculado
-            fecha_estado_final,         # Fecha estado calculada
-            now_utc_db                  # Fecha modificación SIEMPRE se actualiza
-        )
+        valores = (id_porra, id_carrera, id_usuario_actual_int, posiciones_json, vrapida, estado_final_pronostico, fecha_estado_final, now_utc_db)
         cur.execute(sql_upsert, valores)
 
-        # Otorgar Trofeo (sin cambios)
         if should_award_first_bet_trophy:
-            # Usamos el estado final para decidir si el trofeo se otorga YA
-            # En porras administradas, solo se otorga si la apuesta inicial ya fue aceptada
-            # -> Mejor lo asociamos al evento de ACEPTACIÓN si es administrada.
-            # -> Por ahora, mantenemos la lógica original: se otorga al primer registro exitoso
-            #    independientemente del estado final, para simplificar.
              if not _award_trophy(id_usuario_actual_int, 'PRIMERA_APUESTA', conn, cur):
                 print(f"WARN: _award_trophy (PRIMERA_APUESTA) retornó False.")
 
         conn.commit()
-        mensaje_respuesta = "Apuesta registrada/actualizada correctamente."
-        if tipo_porra_actual == 'PRIVADA_ADMINISTRADA' and estado_final_apuesta == 'PENDIENTE':
+        mensaje_respuesta = "Pronóstico registrado/actualizado correctamente."
+        if tipo_porra_actual == 'PRIVADA_ADMINISTRADA' and estado_final_pronostico == 'PENDIENTE':
             mensaje_respuesta += " Pendiente de aprobación por el creador."
 
         return jsonify({"mensaje": mensaje_respuesta}), 201
 
-    except psycopg2.Error as db_error: # Manejo de errores sin cambios
-        print(f"ERROR DB [Registrar Apuesta]: {db_error}")
+    except psycopg2.Error as db_error:
+        print(f"ERROR DB [Registrar Pronóstico]: {db_error}")
         if conn: conn.rollback()
-        return jsonify({"error": "Error de base de datos al registrar apuesta"}), 500
-    except Exception as error: # Manejo de errores sin cambios
-        print(f"ERROR General [Registrar Apuesta]: {error}")
+        return jsonify({"error": "Error de base de datos al registrar el pronóstico"}), 500
+    except Exception as error:
+        print(f"ERROR General [Registrar Pronóstico]: {error}")
         import traceback; traceback.print_exc()
         if conn: conn.rollback()
-        return jsonify({"error": "Error interno al registrar apuesta"}), 500
-    finally: # Sin cambios
+        return jsonify({"error": "Error interno al registrar el pronóstico"}), 500
+    finally:
         if cur is not None and not cur.closed: cur.close()
         if conn is not None and not conn.closed: conn.close()
-# --- FIN Endpoint POST Apuestas MODIFICADO ---
 
 # --- NUEVO Endpoint POST /api/login ---
 # --- Endpoint POST /api/login (MODIFICADO para requerir Email Verificado y añadir claim de admin Y NOMBRE) ---
@@ -1745,10 +1704,11 @@ def crear_porra():
         if conn is not None and not conn.closed:
             conn.close()
 
-# --- Endpoint GET /api/porras/<id_porra>/carreras/<id_carrera>/apuesta (MODIFICADO v2 con estado_apuesta) ---
-@app.route('/api/porras/<int:id_porra>/carreras/<int:id_carrera>/apuesta', methods=['GET'])
+# Obtener el pronóstico de un usuario para una carrera
+# URL MODIFICADA: /api/porras/<id_porra>/carreras/<id_carrera>/forecast
+@app.route('/api/porras/<int:id_porra>/carreras/<int:id_carrera>/forecast', methods=['GET'])
 @jwt_required()
-def obtener_mi_apuesta(id_porra, id_carrera):
+def obtener_mi_pronostico(id_porra, id_carrera):
     id_usuario_actual = get_jwt_identity() # String
     try:
         id_usuario_actual_int = int(id_usuario_actual)
@@ -1760,25 +1720,22 @@ def obtener_mi_apuesta(id_porra, id_carrera):
         conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-        # Verificar membresía (sin cambios)
         sql_check_membership = "SELECT 1 FROM participacion WHERE id_porra = %s AND id_usuario = %s AND estado IN ('CREADOR', 'ACEPTADA');"
         cur.execute(sql_check_membership, (id_porra, id_usuario_actual_int))
         if cur.fetchone() is None: return jsonify({"error": "No eres miembro activo."}), 403
 
-        # --- MODIFICADO: Obtener estado_apuesta ---
         sql_get_bet = """
             SELECT id_apuesta, id_porra, id_carrera, id_usuario, posiciones, vrapida, estado_apuesta
             FROM apuesta
             WHERE id_porra = %s AND id_carrera = %s AND id_usuario = %s;
         """
         cur.execute(sql_get_bet, (id_porra, id_carrera, id_usuario_actual_int))
-        apuesta = cur.fetchone()
+        pronostico = cur.fetchone()
         cur.close()
 
-        if apuesta:
+        if pronostico:
             try:
-                # Parsear JSONB (sin cambios)
-                pos_data = apuesta['posiciones']
+                pos_data = pronostico['posiciones']
                 posiciones_list = []
                 if isinstance(pos_data, str): posiciones_list = json.loads(pos_data)
                 elif isinstance(pos_data, list): posiciones_list = pos_data
@@ -1786,118 +1743,99 @@ def obtener_mi_apuesta(id_porra, id_carrera):
                 else: raise TypeError("Tipo inesperado para 'posiciones'")
 
                 resultado_json = {
-                    "id_apuesta": apuesta["id_apuesta"], "id_porra": apuesta["id_porra"],
-                    "id_carrera": apuesta["id_carrera"], "id_usuario": apuesta["id_usuario"],
-                    "posiciones": posiciones_list, "vrapida": apuesta["vrapida"],
-                    "estado_apuesta": apuesta["estado_apuesta"] # <<< AÑADIDO
+                    "id_apuesta": pronostico["id_apuesta"], "id_porra": pronostico["id_porra"],
+                    "id_carrera": pronostico["id_carrera"], "id_usuario": pronostico["id_usuario"],
+                    "posiciones": posiciones_list, "vrapida": pronostico["vrapida"],
+                    "estado_apuesta": pronostico["estado_apuesta"]
                 }
                 return jsonify(resultado_json), 200
             except (json.JSONDecodeError, TypeError, KeyError) as e:
-                 print(f"Error procesando apuesta {apuesta.get('id_apuesta')}: {e}")
-                 return jsonify({"error": "Error procesando datos de apuesta recuperados"}), 500
+                 print(f"Error procesando pronóstico {pronostico.get('id_apuesta')}: {e}")
+                 return jsonify({"error": "Error procesando datos de pronóstico recuperados"}), 500
         else:
-            return jsonify({"error": "No se encontró apuesta para esta carrera/porra"}), 404
+            return jsonify({"error": "No se encontró pronóstico para esta carrera/grupo"}), 404
 
-    except psycopg2.DatabaseError as db_error: # Sin cambios manejo error
-        print(f"Error DB en obtener_mi_apuesta: {db_error}")
-        return jsonify({"error": "Error de base de datos al obtener la apuesta"}), 500
-    except Exception as error: # Sin cambios manejo error
-        print(f"Error general en obtener_mi_apuesta: {error}")
+    except psycopg2.DatabaseError as db_error:
+        print(f"Error DB en obtener_mi_pronostico: {db_error}")
+        return jsonify({"error": "Error de base de datos al obtener el pronóstico"}), 500
+    except Exception as error:
+        print(f"Error general en obtener_mi_pronostico: {error}")
         import traceback; traceback.print_exc()
-        return jsonify({"error": "Error interno al obtener la apuesta"}), 500
-    finally: # Sin cambios finally
+        return jsonify({"error": "Error interno al obtener el pronóstico"}), 500
+    finally:
         if conn is not None and not conn.closed:
             conn.close()
 
-# --- Endpoint GET /api/porras/.../apuestas/todas (MODIFICADO v2 con estado_apuesta) ---
-@app.route('/api/porras/<int:id_porra>/carreras/<int:id_carrera>/apuestas/todas', methods=['GET'])
+# Obtener todos los pronósticos de una carrera (después de la fecha límite)
+# URL MODIFICADA: /api/porras/<id_porra>/carreras/<id_carrera>/forecasts/all
+@app.route('/api/porras/<int:id_porra>/carreras/<int:id_carrera>/forecasts/all', methods=['GET'])
 @jwt_required()
-def obtener_todas_apuestas_carrera(id_porra, id_carrera):
-    id_usuario_actual = get_jwt_identity() # String
-    try:
-        id_usuario_actual_int = int(id_usuario_actual)
-    except (ValueError, TypeError):
-        return jsonify({"error": "Token de usuario inválido"}), 400
+def obtener_todos_pronosticos_carrera(id_porra, id_carrera):
+    id_usuario_actual = get_jwt_identity()
+    try: id_usuario_actual_int = int(id_usuario_actual)
+    except (ValueError, TypeError): return jsonify({"error": "Token de usuario inválido"}), 400
 
     conn = None
     try:
         conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-        # --- Validaciones (Carrera, Membresía, Fecha Límite - sin cambios) ---
-        # ... (código de validaciones existente) ...
         cur.execute("SELECT fecha_limite_apuesta FROM carrera WHERE id_carrera = %s;", (id_carrera,))
-        carrera_info = cur.fetchone() 
-        if carrera_info is None: 
-            return jsonify({"error": "Carrera no encontrada"}), 404
-        fecha_limite_db = carrera_info['fecha_limite_apuesta'] 
-        if fecha_limite_db is None: 
-            return jsonify({"error": "Fecha límite no definida."}), 409
+        carrera_info = cur.fetchone();
+        if carrera_info is None: return jsonify({"error": "Carrera no encontrada"}), 404
+        fecha_limite_db = carrera_info['fecha_limite_apuesta']
+        if fecha_limite_db is None: return jsonify({"error": "Fecha límite no definida."}), 409
         sql_check_membership = "SELECT 1 FROM participacion WHERE id_porra = %s AND id_usuario = %s AND estado IN ('CREADOR', 'ACEPTADA');"
-        cur.execute(sql_check_membership, (id_porra, id_usuario_actual_int)) 
-        if cur.fetchone() is None: 
-            return jsonify({"error": "No eres miembro activo."}), 403
+        cur.execute(sql_check_membership, (id_porra, id_usuario_actual_int))
+        if cur.fetchone() is None: return jsonify({"error": "No eres miembro activo."}), 403
         try: tz_madrid = ZoneInfo("Europe/Madrid")
         except Exception: tz_madrid = timezone.utc
-        now_local = datetime.now(tz_madrid) 
-        if fecha_limite_db.tzinfo is None: 
-            fecha_limite_db = fecha_limite_db.replace(tzinfo=timezone.utc)
-        if now_local.astimezone(timezone.utc) <= fecha_limite_db.astimezone(timezone.utc): 
-            return jsonify({ "error": "No se pueden ver apuestas hasta después de la fecha límite.", "fecha_limite": fecha_limite_db.isoformat(), }), 403
-        # --- Fin Validaciones ---
+        now_local = datetime.now(tz_madrid)
+        if fecha_limite_db.tzinfo is None: fecha_limite_db = fecha_limite_db.replace(tzinfo=timezone.utc)
+        if now_local.astimezone(timezone.utc) <= fecha_limite_db.astimezone(timezone.utc):
+            return jsonify({ "error": "No se pueden ver los pronósticos hasta después de la fecha límite.", "fecha_limite": fecha_limite_db.isoformat(), }), 403
 
-        # --- Obtener TODAS las apuestas (Añadir estado_apuesta) ---
         sql_get_all_bets = """
-            SELECT
-                u.id_usuario,
-                u.nombre AS nombre_usuario,
-                a.id_apuesta,
-                a.posiciones,
-                a.vrapida,
-                a.estado_apuesta -- <<< AÑADIDO
-            FROM apuesta a
-            JOIN usuario u ON a.id_usuario = u.id_usuario
+            SELECT u.id_usuario, u.nombre AS nombre_usuario, a.id_apuesta,
+                a.posiciones, a.vrapida, a.estado_apuesta
+            FROM apuesta a JOIN usuario u ON a.id_usuario = u.id_usuario
             WHERE a.id_porra = %s AND a.id_carrera = %s
             ORDER BY u.nombre ASC;
             """
         cur.execute(sql_get_all_bets, (id_porra, id_carrera))
-        todas_apuestas = cur.fetchall()
+        todos_pronosticos = cur.fetchall()
         cur.close()
 
-        # --- Formatear la respuesta (incluir estado_apuesta) ---
-        lista_apuestas_formateada = []
-        for apuesta in todas_apuestas:
+        lista_pronosticos_formateada = []
+        for pronostico in todos_pronosticos:
             try:
-                pos_data = apuesta['posiciones']
-                posiciones_list = [] # Parsear JSONB (código existente)
+                pos_data = pronostico['posiciones']
+                posiciones_list = []
                 if isinstance(pos_data, str): posiciones_list = json.loads(pos_data)
                 elif isinstance(pos_data, list): posiciones_list = pos_data
                 elif isinstance(pos_data, dict) and all(isinstance(k, int) for k in pos_data.keys()): posiciones_list = [pos_data[k] for k in sorted(pos_data.keys())]
                 else: raise TypeError("Tipo inesperado para 'posiciones'")
 
-                apuesta_formateada = {
-                    "id_apuesta": apuesta["id_apuesta"],
-                    "id_usuario": apuesta["id_usuario"],
-                    "nombre_usuario": apuesta["nombre_usuario"],
-                    "posiciones": posiciones_list,
-                    "vrapida": apuesta["vrapida"],
-                    "estado_apuesta": apuesta["estado_apuesta"] # <<< AÑADIDO
+                pronostico_formateado = {
+                    "id_apuesta": pronostico["id_apuesta"], "id_usuario": pronostico["id_usuario"],
+                    "nombre_usuario": pronostico["nombre_usuario"], "posiciones": posiciones_list,
+                    "vrapida": pronostico["vrapida"], "estado_apuesta": pronostico["estado_apuesta"]
                 }
-                lista_apuestas_formateada.append(apuesta_formateada)
+                lista_pronosticos_formateada.append(pronostico_formateado)
             except (json.JSONDecodeError, TypeError, KeyError) as e:
-                 print(f"Error formateando apuesta TODAS (ID Apuesta: {apuesta.get('id_apuesta')}): {e}")
+                 print(f"Error formateando pronósticos TODOS (ID: {pronostico.get('id_apuesta')}): {e}")
                  continue
 
-        return jsonify(lista_apuestas_formateada), 200
+        return jsonify(lista_pronosticos_formateada), 200
 
-    except psycopg2.DatabaseError as db_error: # Sin cambios manejo error
-        print(f"Error DB en obtener_todas_apuestas_carrera: {db_error}")
-        return jsonify({"error": "Error de base de datos al obtener apuestas"}), 500
-    except Exception as error: # Sin cambios manejo error
-        print(f"Error general en obtener_todas_apuestas_carrera: {error}")
+    except psycopg2.DatabaseError as db_error:
+        print(f"Error DB en obtener_todos_pronosticos_carrera: {db_error}")
+        return jsonify({"error": "Error de base de datos al obtener pronósticos"}), 500
+    except Exception as error:
+        print(f"Error general en obtener_todos_pronosticos_carrera: {error}")
         import traceback; traceback.print_exc()
-        return jsonify({"error": "Error interno al obtener todas las apuestas"}), 500
-    finally: # Sin cambios finally
+        return jsonify({"error": "Error interno al obtener todos los pronósticos"}), 500
+    finally:
         if conn is not None and not conn.closed:
             conn.close()
 
@@ -4066,38 +4004,33 @@ def change_password():
 # --- FIN NUEVO Endpoint ---
 
 
-# --- Endpoint GET /api/porras/<id_porra>/my-races-bet-status (MODIFICADO v2 con estado_apuesta) ---
-@app.route('/api/porras/<int:id_porra>/my-races-bet-status', methods=['GET'])
+# Obtener el estado de los pronósticos de un usuario en un grupo
+# URL MODIFICADA: /api/porras/<id_porra>/my-races-status
+@app.route('/api/porras/<int:id_porra>/my-races-status', methods=['GET'])
 @jwt_required()
-def get_my_races_with_bet_status(id_porra):
+def get_my_races_with_status(id_porra):
     id_usuario_actual_str = get_jwt_identity()
-    try:
-        id_usuario_actual = int(id_usuario_actual_str)
-    except (ValueError, TypeError):
-        return jsonify({"error": "Token de usuario inválido"}), 400
+    try: id_usuario_actual = int(id_usuario_actual_str)
+    except (ValueError, TypeError): return jsonify({"error": "Token de usuario inválido"}), 400
 
     conn = None
     try:
         conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-        # Obtener año y verificar membresía (sin cambios)
         cur.execute("SELECT ano FROM porra WHERE id_porra = %s;", (id_porra,))
-        porra_info = cur.fetchone() 
-        if not porra_info: 
-            return jsonify({"error": "Porra no encontrada"}), 404
+        porra_info = cur.fetchone();
+        if not porra_info: return jsonify({"error": "Grupo no encontrado"}), 404
         ano_porra = porra_info['ano']
         sql_check_membership = "SELECT 1 FROM participacion WHERE id_porra = %s AND id_usuario = %s AND estado IN ('CREADOR', 'ACEPTADA');"
-        cur.execute(sql_check_membership, (id_porra, id_usuario_actual)) 
-        if cur.fetchone() is None: 
-            return jsonify({"error": "No eres miembro activo."}), 403
+        cur.execute(sql_check_membership, (id_porra, id_usuario_actual))
+        if cur.fetchone() is None: return jsonify({"error": "No eres miembro activo."}), 403
 
-        # --- MODIFICADO: Obtener estado_apuesta ---
         sql_get_races_and_status = """
             SELECT
                 c.id_carrera, c.ano, c.desc_carrera, c.fecha_limite_apuesta,
                 (CASE WHEN a.id_apuesta IS NOT NULL THEN TRUE ELSE FALSE END) as has_bet,
-                a.estado_apuesta, -- <<< AÑADIDO
+                a.estado_apuesta,
                 (CASE WHEN c.resultado_detallado IS NOT NULL THEN TRUE ELSE FALSE END) as has_results
             FROM carrera c
             LEFT JOIN apuesta a ON c.id_carrera = a.id_carrera
@@ -4110,28 +4043,26 @@ def get_my_races_with_bet_status(id_porra):
         races_with_status_raw = cur.fetchall()
         cur.close()
 
-        # Formatear fechas y devolver (incluir estado_apuesta)
         lista_resultado = []
         for row_raw in races_with_status_raw:
             row = dict(row_raw)
             if 'fecha_limite_apuesta' in row and isinstance(row['fecha_limite_apuesta'], datetime):
                  row['fecha_limite_apuesta'] = row['fecha_limite_apuesta'].isoformat()
             row['has_results'] = bool(row.get('has_results', False))
-            # estado_apuesta puede ser None si has_bet es False, lo cual está bien
-            row['estado_apuesta'] = row.get('estado_apuesta') # <<< INCLUIDO
+            row['estado_apuesta'] = row.get('estado_apuesta')
             lista_resultado.append(row)
 
         return jsonify(lista_resultado), 200
 
-    except psycopg2.DatabaseError as db_error: # Sin cambios manejo error
-        print(f"Error DB en get_my_races_with_bet_status: {db_error}")
+    except psycopg2.DatabaseError as db_error:
+        print(f"Error DB en get_my_races_with_status: {db_error}")
         if conn: conn.close()
         return jsonify({"error": "Error DB obteniendo estado carreras"}), 500
-    except Exception as error: # Sin cambios manejo error
-        print(f"ERROR DETALLADO en get_my_races_with_bet_status:"); import traceback; traceback.print_exc()
+    except Exception as error:
+        print(f"ERROR DETALLADO en get_my_races_with_status:"); import traceback; traceback.print_exc()
         if conn: conn.close()
-        return jsonify({"error": "Error interno al obtener estado de apuestas de carreras"}), 500
-    finally: # Sin cambios finally
+        return jsonify({"error": "Error interno al obtener estado de pronósticos de carreras"}), 500
+    finally:
         if conn is not None and not conn.closed:
              conn.close()
 
@@ -4247,72 +4178,65 @@ def unirse_porra_publica(id_porra):
             conn.close()
 
 
-# --- Endpoint GET /api/porras/<id_porra>/my-bets (MODIFICADO v2 con estado_apuesta) ---
-@app.route('/api/porras/<int:id_porra>/my-bets', methods=['GET'])
+# Obtener todos los pronósticos de un usuario en una porra
+# URL MODIFICADA: /api/porras/<int:id_porra>/my-forecasts
+@app.route('/api/porras/<int:id_porra>/my-forecasts', methods=['GET'])
 @jwt_required()
-def get_all_my_bets_in_porra(id_porra):
+def get_all_my_forecasts_in_porra(id_porra):
     id_usuario_actual_str = get_jwt_identity()
-    try:
-        id_usuario_actual = int(id_usuario_actual_str)
-    except (ValueError, TypeError):
-        return jsonify({"error": "Token de usuario inválido"}), 400
+    try: id_usuario_actual = int(id_usuario_actual_str)
+    except (ValueError, TypeError): return jsonify({"error": "Token de usuario inválido"}), 400
 
     conn = None
     try:
         conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-        # Verificar membresía (sin cambios)
         sql_check_membership = "SELECT 1 FROM participacion WHERE id_porra = %s AND id_usuario = %s AND estado IN ('CREADOR', 'ACEPTADA');"
         cur.execute(sql_check_membership, (id_porra, id_usuario_actual))
         if cur.fetchone() is None: return jsonify({"error": "No eres miembro activo."}), 403
 
-        # --- MODIFICADO: Obtener estado_apuesta ---
         sql_get_bets = """
             SELECT id_apuesta, id_porra, id_carrera, id_usuario, posiciones, vrapida, estado_apuesta
-            FROM apuesta
-            WHERE id_porra = %s AND id_usuario = %s
-            ORDER BY id_carrera ASC; -- Opcional: ordenar por carrera
+            FROM apuesta WHERE id_porra = %s AND id_usuario = %s ORDER BY id_carrera ASC;
         """
         cur.execute(sql_get_bets, (id_porra, id_usuario_actual))
-        my_bets = cur.fetchall()
+        my_forecasts = cur.fetchall()
         cur.close()
 
-        # Formatear la respuesta
-        lista_apuestas_formateada = []
-        for apuesta in my_bets:
+        lista_pronosticos_formateada = []
+        for pronostico in my_forecasts:
             try:
-                # Parsear JSONB (sin cambios)
-                pos_data = apuesta['posiciones']
+                pos_data = pronostico['posiciones']
                 posiciones_list = []
                 if isinstance(pos_data, str): posiciones_list = json.loads(pos_data)
                 elif isinstance(pos_data, list): posiciones_list = pos_data
                 elif isinstance(pos_data, dict) and all(isinstance(k, int) for k in pos_data.keys()): posiciones_list = [pos_data[k] for k in sorted(pos_data.keys())]
                 else: raise TypeError("Tipo inesperado para 'posiciones'")
 
-                apuesta_formateada = {
-                    "id_apuesta": apuesta["id_apuesta"], "id_porra": apuesta["id_porra"],
-                    "id_carrera": apuesta["id_carrera"], "id_usuario": apuesta["id_usuario"],
-                    "posiciones": posiciones_list, "vrapida": apuesta["vrapida"],
-                    "estado_apuesta": apuesta["estado_apuesta"] # <<< AÑADIDO
+                pronostico_formateado = {
+                    "id_apuesta": pronostico["id_apuesta"], "id_porra": pronostico["id_porra"],
+                    "id_carrera": pronostico["id_carrera"], "id_usuario": pronostico["id_usuario"],
+                    "posiciones": posiciones_list, "vrapida": pronostico["vrapida"],
+                    "estado_apuesta": pronostico["estado_apuesta"]
                 }
-                lista_apuestas_formateada.append(apuesta_formateada)
+                lista_pronosticos_formateada.append(pronostico_formateado)
             except (json.JSONDecodeError, TypeError, KeyError) as e:
-                 print(f"Error formateando my-bets (ID Apuesta: {apuesta.get('id_apuesta')}): {e}")
+                 print(f"Error formateando my-forecasts (ID: {pronostico.get('id_apuesta')}): {e}")
                  continue
 
-        return jsonify(lista_apuestas_formateada), 200
+        return jsonify(lista_pronosticos_formateada), 200
 
-    except psycopg2.DatabaseError as db_error: # Sin cambios manejo error
-        print(f"Error DB en get_all_my_bets_in_porra: {db_error}")
+    except psycopg2.DatabaseError as db_error:
+        print(f"Error DB en get_all_my_forecasts_in_porra: {db_error}")
         if conn: conn.rollback()
-        return jsonify({"error": "Error de base de datos al obtener mis apuestas"}), 500
-    except Exception as error: # Sin cambios manejo error
-        print(f"Error general en get_all_my_bets_in_porra: {error}")
+        return jsonify({"error": "Error de base de datos al obtener mis pronósticos"}), 500
+    except Exception as error:
+        print(f"Error general en get_all_my_forecasts_in_porra: {error}")
         import traceback; traceback.print_exc()
         if conn: conn.rollback()
-        return jsonify({"error": "Error interno al obtener mis apuestas"}), 500
-    finally: # Sin cambios finally
+        return jsonify({"error": "Error interno al obtener mis pronósticos"}), 500
+    finally:
         if conn is not None and not conn.closed:
             conn.close()
 
@@ -4547,54 +4471,38 @@ def update_fcm_token():
 
 # --- FIN Nuevo Endpoint ---
 
-# --- NUEVO Endpoint GET para listar apuestas pendientes (Creador Porra Administrada) ---
-@app.route('/api/porras/<int:id_porra>/carreras/<int:id_carrera>/apuestas/pendientes', methods=['GET'])
+# Listar pronósticos pendientes para el creador de un grupo
+# URL MODIFICADA: /api/porras/<id_porra>/carreras/<id_carrera>/forecasts/pending
+@app.route('/api/porras/<int:id_porra>/carreras/<int:id_carrera>/forecasts/pending', methods=['GET'])
 @jwt_required()
-def listar_apuestas_pendientes(id_porra, id_carrera):
-    id_usuario_actual = get_jwt_identity() # String
+def listar_pronosticos_pendientes(id_porra, id_carrera):
+    id_usuario_actual = get_jwt_identity()
 
     conn = None
     try:
         conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-        # 1. Verificar que la porra existe, es administrada y el usuario es el creador
-        sql_check_creator = """
-            SELECT id_creador, tipo_porra FROM porra WHERE id_porra = %s;
-            """
+        sql_check_creator = "SELECT id_creador, tipo_porra FROM porra WHERE id_porra = %s;"
         cur.execute(sql_check_creator, (id_porra,))
         porra_info = cur.fetchone()
 
-        if not porra_info:
-            return jsonify({"error": "Porra no encontrada"}), 404
-
-        if porra_info['tipo_porra'] != 'PRIVADA_ADMINISTRADA':
-            return jsonify({"error": "Esta porra no es de tipo administrada"}), 403 # Forbidden
-
+        if not porra_info: return jsonify({"error": "Grupo no encontrado"}), 404
+        if porra_info['tipo_porra'] != 'PRIVADA_ADMINISTRADA': return jsonify({"error": "Este grupo no es de tipo administrado"}), 403
+        
         try:
-            id_creador_db = porra_info['id_creador']
-            id_usuario_actual_int = int(id_usuario_actual)
-            if id_creador_db != id_usuario_actual_int:
-                return jsonify({"error": "Solo el creador puede ver las apuestas pendientes"}), 403 # Forbidden
-        except (ValueError, TypeError):
-             return jsonify({"error": "Error interno de autorización"}), 500
+            id_creador_db = porra_info['id_creador']; id_usuario_actual_int = int(id_usuario_actual)
+            if id_creador_db != id_usuario_actual_int: return jsonify({"error": "Solo el creador puede ver los pronósticos pendientes"}), 403
+        except (ValueError, TypeError): return jsonify({"error": "Error interno de autorización"}), 500
 
-        # 2. Verificar que la carrera existe (opcional pero bueno)
         cur.execute("SELECT 1 FROM carrera WHERE id_carrera = %s;", (id_carrera,))
-        if cur.fetchone() is None:
-            return jsonify({"error": "Carrera no encontrada"}), 404
+        if cur.fetchone() is None: return jsonify({"error": "Carrera no encontrada"}), 404
 
-        # 3. Obtener apuestas pendientes para esta carrera/porra
         sql_get_pending = """
-            SELECT
-                a.id_apuesta,
-                a.id_usuario,
-                u.nombre AS nombre_usuario,
-                a.fecha_creacion -- Fecha en que se realizó/modificó la apuesta
-            FROM apuesta a
-            JOIN usuario u ON a.id_usuario = u.id_usuario
+            SELECT a.id_apuesta, a.id_usuario, u.nombre AS nombre_usuario, a.fecha_creacion
+            FROM apuesta a JOIN usuario u ON a.id_usuario = u.id_usuario
             WHERE a.id_porra = %s AND a.id_carrera = %s AND a.estado_apuesta = 'PENDIENTE'
-            ORDER BY a.fecha_creacion ASC; -- O por nombre de usuario?
+            ORDER BY a.fecha_creacion ASC;
             """
         cur.execute(sql_get_pending, (id_porra, id_carrera))
         pending_bets = cur.fetchall()
@@ -4607,113 +4515,99 @@ def listar_apuestas_pendientes(id_porra, id_carrera):
                 bet_dict['fecha_creacion'] = bet_dict['fecha_creacion'].isoformat()
             lista_pendientes.append(bet_dict)
 
-        return jsonify(lista_pendientes), 200 # Devuelve la lista (puede ser vacía)
+        return jsonify(lista_pendientes), 200
 
     except psycopg2.Error as db_error:
-        print(f"Error DB en listar_apuestas_pendientes: {db_error}")
+        print(f"Error DB en listar_pronosticos_pendientes: {db_error}")
         return jsonify({"error": "Error de base de datos"}), 500
     except Exception as error:
-        print(f"Error inesperado en listar_apuestas_pendientes: {error}")
-        return jsonify({"error": "Error interno al listar apuestas pendientes"}), 500
+        print(f"Error inesperado en listar_pronosticos_pendientes: {error}")
+        return jsonify({"error": "Error interno al listar pronósticos pendientes"}), 500
     finally:
         if conn is not None and not conn.closed:
             conn.close()
-# --- FIN NUEVO Endpoint GET ---
 
-# --- Endpoint POST para aceptar/rechazar apuesta (MODIFICADO para Notificación) ---
-@app.route('/api/apuestas/<int:id_apuesta>/respuesta', methods=['POST'])
+# Responder a un pronóstico pendiente
+# URL MODIFICADA: /api/forecasts/<id_pronostico>/response
+@app.route('/api/forecasts/<int:id_pronostico>/response', methods=['POST'])
 @jwt_required()
-def responder_apuesta_pendiente(id_apuesta):
-    id_usuario_actual = get_jwt_identity() # String (El creador que responde)
+def responder_pronostico_pendiente(id_pronostico):
+    id_usuario_actual = get_jwt_identity()
 
     if not request.is_json: return jsonify({"error": "La solicitud debe ser JSON"}), 400
     data = request.get_json()
-    aceptar = data.get('aceptar') # Booleano
+    aceptar = data.get('aceptar')
     if aceptar is None or not isinstance(aceptar, bool): return jsonify({"error": "Falta 'aceptar' (true/false) o inválido"}), 400
 
     conn = None
-    cur = None # Asegurar que cur se pueda cerrar en finally
+    cur = None
     try:
         conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-        # 1. Obtener detalles apuesta, porra, usuario APOSTADOR y carrera
         sql_get_info = """
             SELECT
-                a.id_usuario, a.id_carrera, a.estado_apuesta, -- Datos apuesta y usuario apostador
-                p.id_porra, p.nombre_porra, p.id_creador, p.tipo_porra, -- Datos porra
-                c.desc_carrera, -- Datos carrera
-                u.fcm_token -- Token del APOSTADOR
+                a.id_usuario, a.id_carrera, a.estado_apuesta, p.id_porra, p.nombre_porra, p.id_creador, p.tipo_porra,
+                c.desc_carrera, u.fcm_token
             FROM apuesta a
             JOIN porra p ON a.id_porra = p.id_porra
             JOIN carrera c ON a.id_carrera = c.id_carrera
-            JOIN usuario u ON a.id_usuario = u.id_usuario -- JOIN con usuario APOSTADOR
+            JOIN usuario u ON a.id_usuario = u.id_usuario
             WHERE a.id_apuesta = %s;
             """
-        cur.execute(sql_get_info, (id_apuesta,))
+        cur.execute(sql_get_info, (id_pronostico,))
         info = cur.fetchone()
 
-        if not info: return jsonify({"error": "Apuesta no encontrada"}), 404
-
-        # 2. Validaciones (Porra admin, Creador, Estado pendiente)
-        if info['tipo_porra'] != 'PRIVADA_ADMINISTRADA': return jsonify({"error": "Apuesta no pertenece a porra administrada"}), 403
+        if not info: return jsonify({"error": "Pronóstico no encontrado"}), 404
+        if info['tipo_porra'] != 'PRIVADA_ADMINISTRADA': return jsonify({"error": "El pronóstico no pertenece a un grupo administrado"}), 403
         try:
-            id_creador_db = info['id_creador']
-            id_usuario_actual_int = int(id_usuario_actual)
+            id_creador_db = info['id_creador']; id_usuario_actual_int = int(id_usuario_actual)
             if id_creador_db != id_usuario_actual_int: return jsonify({"error": "Solo el creador puede gestionar"}), 403
         except (ValueError, TypeError): return jsonify({"error": "Error interno autorización"}), 500
-        if info['estado_apuesta'] != 'PENDIENTE': return jsonify({"error": "Apuesta ya no está pendiente"}), 409
+        if info['estado_apuesta'] != 'PENDIENTE': return jsonify({"error": "El pronóstico ya no está pendiente"}), 409
 
-        # 3. Actualizar estado de la apuesta
         nuevo_estado = 'ACEPTADA' if aceptar else 'RECHAZADA'
         fecha_decision = datetime.now(timezone.utc)
         sql_update_bet = "UPDATE apuesta SET estado_apuesta = %s, fecha_estado_apuesta = %s WHERE id_apuesta = %s;"
-        cur.execute(sql_update_bet, (nuevo_estado, fecha_decision, id_apuesta))
+        cur.execute(sql_update_bet, (nuevo_estado, fecha_decision, id_pronostico))
 
-        # --- 4. Enviar Notificación (si hay token) ---
         fcm_token_apostador = info.get('fcm_token')
         id_usuario_apostador = info.get('id_usuario')
         nombre_carrera = info.get('desc_carrera', 'esta carrera')
-        nombre_porra = info.get('nombre_porra', 'esta porra')
+        nombre_porra = info.get('nombre_porra', 'este grupo')
 
         if fcm_token_apostador and id_usuario_apostador:
-            print(f"DEBUG [Responder Apuesta]: Intentando enviar notif '{nuevo_estado}' a user {id_usuario_apostador}...")
+            print(f"DEBUG [Responder Pronóstico]: Intentando enviar notif '{nuevo_estado}' a user {id_usuario_apostador}...")
             global thread_pool_executor
             if thread_pool_executor:
                  thread_pool_executor.submit(
-                     send_fcm_bet_status_notification_task,
-                     id_usuario_apostador,
-                     fcm_token_apostador,
-                     nombre_carrera,
-                     nombre_porra,
-                     nuevo_estado # 'ACEPTADA' o 'RECHAZADA'
+                     send_fcm_bet_status_notification_task, id_usuario_apostador, fcm_token_apostador,
+                     nombre_carrera, nombre_porra, nuevo_estado
                  )
-                 print(f"DEBUG [Responder Apuesta]: Tarea FCM ({nuevo_estado}) enviada al executor.")
+                 print(f"DEBUG [Responder Pronóstico]: Tarea FCM ({nuevo_estado}) enviada al executor.")
             else:
-                 print("WARN [Responder Apuesta]: ThreadPoolExecutor no disponible, no se pudo enviar tarea FCM.")
+                 print("WARN [Responder Pronóstico]: ThreadPoolExecutor no disponible.")
         else:
-             print(f"DEBUG [Responder Apuesta]: No se envía notificación (token o ID apostador faltante). Token: {'Sí' if fcm_token_apostador else 'No'}, ID: {id_usuario_apostador}")
-        # --- Fin Enviar Notificación ---
+             print(f"DEBUG [Responder Pronóstico]: No se envía notificación (token o ID faltante).")
 
         conn.commit()
         cur.close()
 
-        mensaje = f"Apuesta {'aceptada' if aceptar else 'rechazada'} correctamente."
+        mensaje = f"Pronóstico {'aceptado' if aceptar else 'rechazado'} correctamente."
         return jsonify({"mensaje": mensaje}), 200
 
-    except psycopg2.Error as db_error: # Sin cambios manejo error
-        print(f"Error DB en responder_apuesta_pendiente: {db_error}")
+    except psycopg2.Error as db_error:
+        print(f"Error DB en responder_pronostico_pendiente: {db_error}")
         if conn: conn.rollback()
         return jsonify({"error": "Error de base de datos"}), 500
-    except Exception as error: # Sin cambios manejo error
-        print(f"Error inesperado en responder_apuesta_pendiente: {error}")
+    except Exception as error:
+        print(f"Error inesperado en responder_pronostico_pendiente: {error}")
         import traceback; traceback.print_exc()
         if conn: conn.rollback()
-        return jsonify({"error": "Error interno al responder a la apuesta"}), 500
-    finally: # Sin cambios
+        return jsonify({"error": "Error interno al responder al pronóstico"}), 500
+    finally:
         if cur is not None and not cur.closed: cur.close()
         if conn is not None and not conn.closed: conn.close()
-# --- FIN Endpoint POST Respuesta Apuesta MODIFICADO ---
 
 # Inicializa la variable scheduler globalmente para que atexit pueda accederla
 scheduler = None
