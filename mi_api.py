@@ -4649,7 +4649,7 @@ if os.environ.get('RUN_SCHEDULER', 'false').lower() == 'true':
         scheduler = None # Asegurar que scheduler es None si falla el inicio
 else:
     print("INFO: RUN_SCHEDULER no está activado. El APScheduler no se iniciará en esta instancia.")
-# --- FIN CONDITIONAL SCHEDULER START ---
+# --- FIN CONDITIONAL SCHEDULER STARTT ---
 
 
 # --- Función de apagado (modificada para manejar scheduler condicional) ---
