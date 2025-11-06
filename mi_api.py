@@ -1376,13 +1376,87 @@ def registrar_usuario():
 
 
         try:
-            msg = Message(subject="Verifica tu Email - F1 Porra App",
+            msg = Message(subject="Verifica tu email / Verify your email / Vérifiez votre e-mail / Verifique o seu e-mail / Verifica el teu correu - F1 Porra App",
                           recipients=[email])
-            msg.body = f"""¡Bienvenido/a {nombre}!\n\nGracias por registrarte en F1 Porra App.\n\n
-            Por favor, haz clic en el siguiente enlace para verificar tu dirección de correo electrónico (el enlace expira en 24 horas):\n
-{verification_link}\n\n
-Si no te registraste, por favor ignora este email.\n\n
-Saludos,\nEl equipo de F1 Porra App"""
+            msg.body = f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ES • Verificación de correo
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+¡Bienvenido/a {nombre}!
+
+Gracias por registrarte en F1 Porra App.
+
+Por favor, haz clic en el siguiente enlace para verificar tu dirección de correo electrónico (el enlace caduca en 24 horas):
+{verification_link}
+
+Si no te registraste, por favor ignora este email.
+
+Saludos,
+El equipo de F1 Porra App
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EN • Email Verification
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Welcome {nombre}!
+
+Thank you for registering in F1 Porra App.
+
+Please click the link below to verify your email address (the link expires in 24 hours):
+{verification_link}
+
+If you didn’t create this account, please ignore this email.
+
+Regards,
+The F1 Porra App Team
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FR • Vérification de l’e-mail
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Bienvenue {nombre} !
+
+Merci de vous être inscrit(e) à F1 Porra App.
+
+Veuillez cliquer sur le lien ci-dessous pour vérifier votre adresse e-mail (le lien expire dans 24 heures) :
+{verification_link}
+
+Si vous n’êtes pas à l’origine de cette inscription, ignorez cet e-mail.
+
+Cordialement,
+L’équipe F1 Porra App
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PT • Verificação de e-mail
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Bem-vindo/a {nombre}!
+
+Obrigado por te registares na F1 Porra App.
+
+Clica no link abaixo para verificares o teu e-mail (o link expira em 24 horas):
+{verification_link}
+
+Se não fizeste este registo, ignora este e-mail.
+
+Cumprimentos,
+A equipa da F1 Porra App
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CA • Verificació del correu
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Benvingut/da {nombre}!
+
+Gràcies per registrar-te a F1 Porra App.
+
+Si us plau, fes clic a l’enllaç següent per verificar la teva adreça de correu electrònic (l’enllaç caduca en 24 hores):
+{verification_link}
+
+Si no t’has registrat tu, ignora aquest correu.
+
+Salutacions,
+L’equip de F1 Porra App
+"""
 
             print(f"DEBUG: Intentando enviar email de verificación a {email}...") # Debug
             mail.send(msg)
@@ -1610,15 +1684,15 @@ def login_usuario():
     email = data.get('email')
     password = data.get('password')
     if not email or not password:
-         return jsonify({"error": "Faltan campos requeridos (email, password)"}), 400
+        return jsonify({"error": "Faltan campos requeridos (email, password)"}), 400
     email = email.strip().lower()
     conn = None
     try:
         conn = psycopg2.connect(host=DB_HOST,port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-        # Buscamos al usuario y AÑADIMOS email_verificado, es_admin y nombre
-        sql = "SELECT id_usuario, nombre, email, password_hash, email_verificado, es_admin FROM usuario WHERE email = %s;"
+        # Buscamos al usuario y OBTENEMOS email_verificado, es_admin, nombre y language_code
+        sql = "SELECT id_usuario, nombre, email, password_hash, email_verificado, es_admin, language_code FROM usuario WHERE email = %s;"
         cur.execute(sql, (email,))
         user = cur.fetchone()
         cur.close()
@@ -1629,10 +1703,12 @@ def login_usuario():
 
             # Email verificado y contraseña correcta: Proceder a crear token
             admin_status = user['es_admin']
-            user_name = user['nombre'] # <<< OBTENER EL NOMBRE DEL USUARIO
+            user_name = user['nombre']
+            language_code = user['language_code'] or 'es' # Obtener idioma, con 'es' como fallback
             additional_claims = {
                 "is_admin": admin_status,
-                "nombre_usuario": user_name  # <<< AÑADIR EL NOMBRE AL TOKEN
+                "nombre_usuario": user_name,
+                "language_code": language_code # Añadir idioma al token
             }
             access_token = create_access_token(
                 identity=str(user['id_usuario']),
@@ -3505,14 +3581,83 @@ def request_password_reset():
             # --- FIN CAMBIO DEEP LINK ---
 
             try:
-                msg = Message(subject="Restablecer Contraseña - F1 Porra App",
+                msg = Message(subject="Restablece tu contraseña / Reset your password / Réinitialisez votre mot de passe / Redefine a tua palavra-passe / Restableix la teva contrasenya - F1 Porra App",
                               recipients=[email])
 
-                msg.body = f"""Hola,\n\nHemos recibido una solicitud para restablecer tu contraseña.\n\n
-Haz clic en el siguiente enlace o cópialo en tu navegador para establecer una nueva contraseña (el enlace expira en 30 minutos):\n
-{reset_link}\n\n
-Si no solicitaste esto, puedes ignorar este email.\n\n
-Gracias,\nEl equipo de F1 Porra App"""
+                msg.body = f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ES • Restablecimiento de contraseña
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Hola,
+
+Has solicitado restablecer tu contraseña de F1 Porra App.
+Haz clic en el siguiente enlace para crear una nueva contraseña (el enlace caduca en 24 horas):
+{reset_link}
+
+Si no solicitaste este cambio, ignora este correo.
+
+Saludos,
+El equipo de F1 Porra App
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EN • Password reset
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Hi,
+
+You requested to reset your F1 Porra App password.
+Click the link below to set a new password (the link expires in 24 hours):
+{reset_link}
+
+If you didn’t request this change, please ignore this email.
+
+Regards,
+The F1 Porra App Team
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FR • Réinitialisation du mot de passe
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Bonjour,
+
+Vous avez demandé à réinitialiser votre mot de passe F1 Porra App.
+Cliquez sur le lien ci-dessous pour définir un nouveau mot de passe (le lien expire dans 24 heures) :
+{reset_link}
+
+Si vous n’êtes pas à l’origine de cette demande, ignorez cet e-mail.
+
+Cordialement,
+L’équipe F1 Porra App
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PT • Redefinição de palavra-passe
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Olá,
+
+Pediste redefinir a tua palavra-passe da F1 Porra App.
+Clica no link abaixo para definir uma nova palavra-passe (o link expira em 24 horas):
+{reset_link}
+
+Se não pediste esta alteração, ignora este e-mail.
+
+Cumprimentos,
+A equipa da F1 Porra App
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CA • Restabliment de contrasenya
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Hola,
+
+Has sol·licitat restablir la teva contrasenya de F1 Porra App.
+Fes clic a l’enllaç següent per crear-ne una de nova (l’enllaç caduca en 24 hores):
+{reset_link}
+
+Si no has sol·licitat aquest canvi, ignora aquest correu.
+
+Salutacions,
+L’equip de F1 Porra App
+"""
 
                 print(f"DEBUG: Intentando enviar email de reseteo a {email}...") # Debug
                 mail.send(msg)
@@ -3810,13 +3955,79 @@ def resend_verification_email():
 
 
             try:
-                msg = Message(subject="Verifica tu Email - F1 Porra App (Reenvío)",
+                msg = Message(subject="Reenvío verificación / Resend verification / Renvoi de vérification / Reenviar verificação / Reenviament de verificació - F1 Porra App",
                               recipients=[email])
-                msg.body = f"""Hola {nombre_usuario},\n\nHemos recibido una solicitud para reenviar el email de verificación.\n\n
-                Por favor, haz clic en el siguiente enlace para verificar tu dirección de correo electrónico (el enlace expira en 24 horas):\n
-{verification_link}\n\n
-Si no solicitaste esto, puedes ignorar este email.\n\n
-Saludos,\nEl equipo de F1 Porra App"""
+                msg.body = f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ES • Nuevo enlace de verificación
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Hola {nombre_usuario},
+
+Te enviamos un nuevo enlace para verificar tu correo electrónico (el enlace caduca en 24 horas):
+{verification_link}
+
+Si ya verificaste tu cuenta o no solicitaste este correo, ignóralo.
+
+Saludos,
+El equipo de F1 Porra App
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EN • New verification link
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Hi {nombre_usuario},
+
+Here is a new link to verify your email address (the link expires in 24 hours):
+{verification_link}
+
+If you have already verified your account or didn’t request this email, just ignore it.
+
+Regards,
+The F1 Porra App Team
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FR • Nouveau lien de vérification
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Bonjour {nombre_usuario},
+
+Voici un nouveau lien pour vérifier votre adresse e-mail (le lien expire dans 24 heures) :
+{verification_link}
+
+Si vous avez déjà vérifié votre compte ou n’avez pas demandé cet e-mail, ignorez-le.
+
+Cordialement,
+L’équipe F1 Porra App
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PT • Novo link de verificação
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Olá {nombre_usuario},
+
+Aqui tens um novo link para verificar o teu e-mail (o link expira em 24 horas):
+{verification_link}
+
+Se já verificaste a tua conta ou não pediste este e-mail, ignora-o.
+
+Cumprimentos,
+A equipa da F1 Porra App
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CA • Nou enllaç de verificació
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Hola {nombre_usuario},
+
+T’enviem un nou enllaç per verificar el teu correu electrònic (l’enllaç caduca en 24 hores):
+{verification_link}
+
+Si ja has verificat el compte o no has sol·licitat aquest correu, ignora’l.
+
+Salutacions,
+L’equip de F1 Porra App
+"""
+
+
 
                 print(f"DEBUG: Intentando REenviar email de verificación a {email}...") # Debug
                 mail.send(msg)
@@ -4417,28 +4628,81 @@ def delete_account():
 
 # Endpoint para obtener la lista de todos los trofeos activos
 @app.route('/api/trofeos', methods=['GET'])
+@jwt_required(optional=True)
 def obtener_lista_trofeos():
+    """
+    Devuelve la lista de trofeos ya localizados según el idioma solicitado.
+    Prioridad de idioma:
+      1) ?lang=xx en la query
+      2) language_code del usuario autenticado (si hay JWT)
+      3) 'es' como fallback
+    Fallback de texto:
+      - Si no hay traducción en trofeo_traduccion para ese lang, usa trofeo.nombre/descripcion (español base).
+    """
     conn = None
     try:
+        # 1) Detectar idioma deseado
+        lang_param = (request.args.get('lang') or '').strip().lower()
+        user_lang = None
+        try:
+            # Si hay JWT, intentamos sacar el usuario y su language_code
+            identity = get_jwt_identity()
+            if identity:
+                conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
+                cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+                cur.execute("SELECT language_code FROM usuario WHERE id_usuario = %s;", (identity,))
+                row = cur.fetchone()
+                if row and row.get('language_code'):
+                    user_lang = (row['language_code'] or '').strip().lower()
+                cur.close()
+                conn.close()
+                conn = None
+        except Exception:
+            # si falla, seguimos sin romper
+            pass
+
+        lang = lang_param or user_lang or 'es'
+
+        # 2) Query con LEFT JOIN a traducción + COALESCE
         conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-
-        # Seleccionar solo trofeos activos
-        cur.execute("""
-            SELECT id_trofeo, codigo_trofeo, nombre, descripcion, icono_url, categoria
-            FROM trofeo
-            WHERE activo = TRUE
-            ORDER BY categoria, nombre;
-        """)
+        sql = """
+            SELECT
+                t.id_trofeo,
+                t.codigo_trofeo,
+                COALESCE(tt.nombre, t.nombre) AS nombre,
+                COALESCE(tt.descripcion, t.descripcion) AS descripcion,
+                t.icono_url,
+                t.categoria
+            FROM trofeo t
+            LEFT JOIN trofeo_traduccion tt
+                   ON tt.id_trofeo = t.id_trofeo AND tt.lang = %s
+            WHERE t.activo = TRUE
+            ORDER BY t.categoria, nombre;
+        """
+        cur.execute(sql, (lang,))
         trofeos = cur.fetchall()
         cur.close()
+        conn.close()
+        conn = None
 
-        lista_trofeos = [dict(t) for t in trofeos]
-        return jsonify(lista_trofeos), 200
+        # 3) Formato JSON
+        lista = []
+        for r in trofeos:
+            lista.append({
+                "id_trofeo": r["id_trofeo"],
+                "codigo_trofeo": r["codigo_trofeo"],
+                "nombre": r["nombre"],
+                "descripcion": r["descripcion"],
+                "icono_url": r["icono_url"],
+                "categoria": r["categoria"],
+                "lang": lang  # útil para depurar
+            })
+        return jsonify(lista), 200
 
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"Error en obtener_lista_trofeos: {error}")
-        return jsonify({"error": "Error interno al obtener la lista de trofeos"}), 500
+        return jsonify({"error": "Error interno al obtener trofeos"}), 500
     finally:
         if conn is not None:
             conn.close()
@@ -4447,42 +4711,63 @@ def obtener_lista_trofeos():
 @app.route('/api/profile/trofeos', methods=['GET'])
 @jwt_required()
 def obtener_mis_trofeos():
+    """
+    Devuelve los trofeos conseguidos por el usuario, localizados.
+    Soporta ?lang=xx y fallback igual que /api/trofeos.
+    """
     id_usuario_actual = get_jwt_identity()
     conn = None
     try:
+        # 1) idioma deseado
+        lang_param = (request.args.get('lang') or '').strip().lower()
+        user_lang = None
+
         conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute("SELECT language_code FROM usuario WHERE id_usuario = %s;", (id_usuario_actual,))
+        row = cur.fetchone()
+        if row and row.get('language_code'):
+            user_lang = (row['language_code'] or '').strip().lower()
+        lang = lang_param or user_lang or 'es'
 
-        # Unir usuario_trofeo con trofeo para obtener detalles
+        # 2) Query con LEFT JOIN a traducción y COALESCE
         sql = """
             SELECT
                 t.id_trofeo,
                 t.codigo_trofeo,
-                t.nombre,
-                t.descripcion,
+                COALESCE(tt.nombre, t.nombre) AS nombre,
+                COALESCE(tt.descripcion, t.descripcion) AS descripcion,
                 t.icono_url,
                 t.categoria,
                 ut.fecha_conseguido,
                 ut.detalles_adicionales
             FROM usuario_trofeo ut
-            JOIN trofeo t ON ut.id_trofeo = t.id_trofeo
+            JOIN trofeo t ON t.id_trofeo = ut.id_trofeo
+            LEFT JOIN trofeo_traduccion tt
+                   ON tt.id_trofeo = t.id_trofeo AND tt.lang = %s
             WHERE ut.id_usuario = %s
-            ORDER BY ut.fecha_conseguido DESC, t.nombre;
+            ORDER BY ut.fecha_conseguido DESC, t.categoria, nombre;
         """
-        cur.execute(sql, (id_usuario_actual,))
-        trofeos_usuario = cur.fetchall()
+        cur.execute(sql, (lang, id_usuario_actual))
+        filas = cur.fetchall()
         cur.close()
+        conn.close()
+        conn = None
 
-        # Convertir a lista, asegurando que las fechas y JSON sean serializables
         lista_resultado = []
-        for row in trofeos_usuario:
-            trofeo_dict = dict(row)
-            # Convertir fecha a ISO 8601 string
-            if isinstance(trofeo_dict.get('fecha_conseguido'), datetime):
-                trofeo_dict['fecha_conseguido'] = trofeo_dict['fecha_conseguido'].isoformat()
-            # 'detalles_adicionales' ya debería ser un dict/list si DictCursor lo maneja bien con JSONB,
-            # o podría ser un string JSON si no. Aquí asumimos que ya es serializable.
-            lista_resultado.append(trofeo_dict)
+        for r in filas:
+            item = {
+                "id_trofeo": r["id_trofeo"],
+                "codigo_trofeo": r["codigo_trofeo"],
+                "nombre": r["nombre"],
+                "descripcion": r["descripcion"],
+                "icono_url": r["icono_url"],
+                "categoria": r["categoria"],
+                "fecha_conseguido": r["fecha_conseguido"].isoformat() if r["fecha_conseguido"] else None,
+                "detalles_adicionales": r["detalles_adicionales"],
+                "lang": lang
+            }
+            lista_resultado.append(item)
 
         return jsonify(lista_resultado), 200
 
@@ -4714,6 +4999,45 @@ def responder_apuesta_pendiente(id_apuesta):
         if cur is not None and not cur.closed: cur.close()
         if conn is not None and not conn.closed: conn.close()
 # --- FIN Endpoint POST Respuesta Apuesta MODIFICADO ---
+
+# --- Endpoint PUT /api/profile/language (Protegido) ---
+# Permite al usuario autenticado cambiar su preferencia de idioma
+@app.route('/api/profile/language', methods=['PUT'])
+@jwt_required()
+def update_language():
+    id_usuario_actual = get_jwt_identity()
+
+    if not request.is_json:
+        return jsonify({"error": "La solicitud debe ser JSON"}), 400
+
+    data = request.get_json()
+    language_code = data.get('language_code')
+
+    # Validación
+    if not language_code or language_code not in ['es', 'en', 'fr', 'pt', 'ca']:
+        return jsonify({"error": "Falta 'language_code' o es inválido. Valores permitidos: es, en, fr, pt, ca"}), 400
+
+    conn = None
+    try:
+        conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
+        cur = conn.cursor()
+
+        # Actualizar el idioma del usuario
+        sql_update = "UPDATE usuario SET language_code = %s WHERE id_usuario = %s;"
+        cur.execute(sql_update, (language_code, id_usuario_actual))
+
+        conn.commit()
+        cur.close()
+
+        return jsonify({"mensaje": "Idioma actualizado correctamente."}), 200
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"Error en update_language: {error}")
+        if conn: conn.rollback()
+        return jsonify({"error": "Error interno al actualizar el idioma"}), 500
+    finally:
+        if conn is not None:
+            conn.close()
 
 # Inicializa la variable scheduler globalmente para que atexit pueda accederla
 scheduler = None
