@@ -5,7 +5,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from flask_jwt_extended import get_jwt, create_access_token, get_jwt_identity, jwt_required, JWTManager # Importar JWT
 from flask_mail import Mail, Message # Importar Flask-Mail
 import os # Necesario para variables de entorno
-from datetime import datetime, timezone,timedelta # Para fechas y horas
+from datetime import datetime, timezone,timedelta, date # Para fechas y horas
 import secrets # Para generar tokens seguros
 from urllib.parse import urlparse
 import json # <--- AÑADIR ESTA LÍNEA
@@ -137,6 +137,154 @@ thread_pool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WOR
 print(f"INFO: ThreadPoolExecutor inicializado con max_workers={MAX_WORKERS_FCM}")
 # --- FIN NUEVO ---
 
+
+# ======= i18n para notificaciones FCM =======
+SUPPORTED_LANGS = {'es','en','fr','pt','ca'}
+
+def _pick_lang(lang: str) -> str:
+    lang = (lang or '').strip().lower()
+    return lang if lang in SUPPORTED_LANGS else 'es'
+
+# Diccionario de textos (placeholders: {race}, {deadline}, {porra}, {status}, {current}, {next})
+FCM_TEXTS = {
+    'deadline_reminder': {
+        'title': {
+            'es': "⏰ ¡Última oportunidad!",
+            'en': "⏰ Last chance!",
+            'fr': "⏰ Dernière chance !",
+            'pt': "⏰ Última oportunidade!",
+            'ca': "⏰ Última oportunitat!"
+        },
+        'body': {
+            'es': "La fecha límite para apostar en {race} es pronto ({deadline}). ¡No te olvides!",
+            'en': "Betting for {race} closes soon ({deadline}). Don’t forget!",
+            'fr': "Les paris pour {race} se terminent bientôt ({deadline}). N’oublie pas !",
+            'pt': "As apostas para {race} fecham em breve ({deadline}). Não te esqueças!",
+            'ca': "L’aposta per {race} tanca aviat ({deadline}). No t’oblidis!"
+        }
+    },
+    'bet_status_update': {
+        'title': {
+            'es': "🎯 Estado de tu apuesta",
+            'en': "🎯 Bet status",
+            'fr': "🎯 Statut du pari",
+            'pt': "🎯 Estado da aposta",
+            'ca': "🎯 Estat de l’aposta"
+        },
+        'body_accept': {
+            'es': "Tu apuesta para {race} en la porra “{porra}” ha sido ACEPTADA.",
+            'en': "Your bet for {race} in pool “{porra}” has been ACCEPTED.",
+            'fr': "Ton pari pour {race} dans la porra “{porra}” a été ACCEPTÉ.",
+            'pt': "A tua aposta para {race} na porra “{porra}” foi ACEITE.",
+            'ca': "La teva aposta per {race} a la porra “{porra}” ha estat ACCEPTADA."
+        },
+        'body_reject': {
+            'es': "Tu apuesta para {race} en la porra “{porra}” ha sido RECHAZADA.",
+            'en': "Your bet for {race} in pool “{porra}” has been REJECTED.",
+            'fr': "Ton pari pour {race} dans la porra “{porra}” a été REFUSÉ.",
+            'pt': "A tua aposta para {race} na porra “{porra}” foi RECUSADA.",
+            'ca': "La teva aposta per {race} a la porra “{porra}” ha estat REBUTJADA."
+        }
+    },
+    'porra_invitation': {
+        'title': {
+            'es': "👋 Invitación a porra",
+            'en': "👋 Pool invitation",
+            'fr': "👋 Invitation à une porra",
+            'pt': "👋 Convite para porra",
+            'ca': "👋 Invitació a una porra"
+        },
+        'body': {
+            'es': "{inviter} te ha invitado a unirte a “{porra}”.",
+            'en': "{inviter} has invited you to join “{porra}”.",
+            'fr': "{inviter} t’a invité à rejoindre “{porra}”.",
+            'pt': "{inviter} convidou-te para entrares em “{porra}”.",
+            'ca': "{inviter} t’ha convidat a unir-te a “{porra}”."
+        }
+    },
+    'result_ready': {
+        'title': {
+            'es': "🏁 ¡Resultado disponible!",
+            'en': "🏁 Result is out!",
+            'fr': "🏁 Résultat disponible !",
+            'pt': "🏁 Resultado disponível!",
+            'ca': "🏁 Resultat disponible!"
+        },
+        'body': {
+            'es': "Ya puedes ver tus puntos para {race}.",
+            'en': "You can now check your points for {race}.",
+            'fr': "Tu peux voir tes points pour {race}.",
+            'pt': "Já podes ver os teus pontos para {race}.",
+            'ca': "Ja pots veure els teus punts per {race}."
+        }
+    },
+    'next_race_available': {
+        'title': {
+            'es': "🚀 ¡Nueva carrera abierta!",
+            'en': "🚀 Next race open!",
+            'fr': "🚀 Prochaine course ouverte !",
+            'pt': "🚀 Próxima corrida aberta!",
+            'ca': "🚀 Nova cursa oberta!"
+        },
+        'body': {
+            'es': "Resultados de {current} listos. Ya puedes apostar en {next}.",
+            'en': "Results for {current} are ready. You can now bet on {next}.",
+            'fr': "Résultats de {current} prêts. Tu peux parier sur {next}.",
+            'pt': "Resultados de {current} prontos. Já podes apostar em {next}.",
+            'ca': "Resultats de {current} llestos. Ja pots apostar a {next}."
+        }
+    },
+    'betting_closed': {
+        'title': {
+            'es': "🔒 Apuestas cerradas",
+            'en': "🔒 Betting closed",
+            'fr': "🔒 Paris fermés",
+            'pt': "🔒 Apostas encerradas",
+            'ca': "🔒 Apostes tancades"
+        },
+        'body': {
+            'es': "Las apuestas para {race} han cerrado.",
+            'en': "Betting for {race} is now closed.",
+            'fr': "Les paris pour {race} sont fermés.",
+            'pt': "As apostas para {race} foram encerradas.",
+            'ca': "Les apostes per {race} s’han tancat."
+        }
+    },
+    'trophy_unlocked': {
+        'title': {
+            'es': "🏆 ¡Nuevo trofeo!",
+            'en': "🏆 New trophy!",
+            'fr': "🏆 Nouveau trophée !",
+            'pt': "🏆 Novo troféu!",
+            'ca': "🏆 Nou trofeu!"
+        },
+        'body': {
+            'es': "Has conseguido el trofeo: {trophy}.",
+            'en': "You’ve unlocked the trophy: {trophy}.",
+            'fr': "Tu as obtenu le trophée : {trophy}.",
+            'pt': "Conseguiste o troféu: {trophy}.",
+            'ca': "Has aconseguit el trofeu: {trophy}."
+        }
+    }
+}
+
+def _fcm_text(kind: str, lang: str, **kwargs):
+    lang = _pick_lang(lang)
+    pack = FCM_TEXTS.get(kind, {})
+    title_map = pack.get('title', {})
+    # Para bet_status_update elegimos body según status
+    if kind == 'bet_status_update':
+        status = kwargs.get('status', 'ACEPTADA')
+        body_map = pack.get('body_accept' if status == 'ACEPTADA' else 'body_reject', {})
+    else:
+        body_map = pack.get('body', {})
+    title = title_map.get(lang, title_map.get('es', ''))
+    body_tpl = body_map.get(lang, body_map.get('es', ''))
+    return title, body_tpl.format(**kwargs)
+# ======= fin i18n =======
+
+
+
 # --- check_deadlines_and_notify MODIFICADA (v2 - notifica una vez por usuario/carrera) ---
 def check_deadlines_and_notify():
     """
@@ -222,31 +370,45 @@ def check_deadlines_and_notify():
                     if user_ids_to_query_tokens:
                         placeholders = ','.join(['%s'] * len(user_ids_to_query_tokens))
                         sql_get_tokens = f"""
-                            SELECT id_usuario, fcm_token FROM usuario
-                            WHERE id_usuario IN ({placeholders}) AND fcm_token IS NOT NULL AND fcm_token != '';
+                            SELECT id_usuario, fcm_token, language_code
+                            FROM usuario
+                            WHERE id_usuario IN ({placeholders})
+                              AND fcm_token IS NOT NULL AND fcm_token != '';
                         """
                         cur.execute(sql_get_tokens, tuple(user_ids_to_query_tokens))
                         tokens_found = cur.fetchall()
-                        for user_token_row in tokens_found:
-                            unique_users_needing_reminder_for_race[user_token_row['id_usuario']] = user_token_row['fcm_token']
+                        for row in tokens_found:
+                            unique_users_needing_reminder_for_race[row['id_usuario']] = {
+                                "token": row['fcm_token'],
+                                "lang": (row['language_code'] or 'es').strip().lower()
+                            }
             
             # Enviar notificaciones masivas UNA VEZ por carrera con los tokens únicos recolectados
-            fcm_tokens_for_this_race_event = list(unique_users_needing_reminder_for_race.values())
-            if fcm_tokens_for_this_race_event:
-                print(f"  TAREA DEADLINE: Enviando recordatorio para {len(fcm_tokens_for_this_race_event)} usuarios únicos para la carrera '{desc_carrera}'.")
-                # La función send_bulk_fcm_reminders ya es genérica y envía a una lista de tokens
-                # y el mensaje es sobre la carrera, no una porra específica.
-                # Se le pasa 'desc_carrera' y 'fecha_limite_str'.
-                # La data payload también debe ser genérica:
+            # Envío por usuario respetando el idioma
+            pairs = [(v["token"], v["lang"]) for v in unique_users_needing_reminder_for_race.values()
+                     if isinstance(v, dict) and v.get("token")]
+            if pairs:
+                print(f"  TAREA DEADLINE: Enviando recordatorio (i18n) para {len(pairs)} usuarios únicos para la carrera '{desc_carrera}'.")
                 data_payload = {
                     'tipo_notificacion': 'deadline_reminder',
                     'race_name': desc_carrera,
-                    'race_id': str(id_carrera), # Añadido
-                    'ano_carrera': str(ano_carrera) # Añadido
+                    'race_id': str(id_carrera),
+                    'ano_carrera': str(ano_carrera)
                 }
-                send_bulk_fcm_reminders_generic(fcm_tokens_for_this_race_event, desc_carrera, fecha_limite_str, data_payload)
+                for token, lang in pairs:
+                    try:
+                        title, body = _fcm_text('deadline_reminder', lang, race=desc_carrera, deadline=fecha_limite_str)
+                        message = messaging.Message(
+                            notification=messaging.Notification(title=title, body=body),
+                            data=data_payload,
+                            token=token
+                        )
+                        thread_pool_executor.submit(_send_single_reminder_task, message)
+                    except Exception as err:
+                        print(f"ERROR al programar envío deadline_reminder: {err}")
             else:
                 print(f"  TAREA DEADLINE: No hay nuevos usuarios/tokens que notificar para la carrera '{desc_carrera}'.")
+
 
     except psycopg2.Error as db_err:
         print(f"!!!!!!!! TAREA DEADLINE PROGRAMADA DB ERROR !!!!!!!!")
@@ -359,9 +521,9 @@ def _send_single_reminder_task(message):
 
 # --- NUEVA Función para Notificación de Estado de Apuesta ---
 # Similar a send_fcm_result_notification_task
-def send_fcm_bet_status_notification_task(user_id, fcm_token, race_name, porra_name, new_status):
+def send_fcm_bet_status_notification_task(user_id, fcm_token, race_name, porra_name, new_status, lang='es'):
     """
-    Tarea en background para enviar notificación FCM sobre aceptación/rechazo de apuesta.
+    Tarea en background para enviar notificación FCM sobre aceptación/rechazo de apuesta (multiidioma).
     """
     status_text = "ACEPTADA" if new_status == 'ACEPTADA' else "RECHAZADA"
     print(f"BACKGROUND TASK (Bet Status): Iniciando envío FCM para user {user_id}, apuesta {status_text} en '{race_name}'...")
@@ -373,14 +535,18 @@ def send_fcm_bet_status_notification_task(user_id, fcm_token, race_name, porra_n
             try:
                 if os.path.exists(FIREBASE_CRED_PATH):
                     cred_task = credentials.Certificate(FIREBASE_CRED_PATH)
-                    firebase_admin.initialize_app(cred_task, {'projectId': FIREBASE_PROJECT_ID}, name=f'firebase-task-betstatus-{user_id}-{datetime.now().timestamp()}')
+                    firebase_admin.initialize_app(
+                        cred_task,
+                        {'projectId': FIREBASE_PROJECT_ID},
+                        name=f'firebase-task-betstatus-{user_id}-{datetime.now().timestamp()}'
+                    )
                     print("BACKGROUND TASK (Bet Status): Firebase inicializado DENTRO de la tarea.")
                 else:
                     print(f"BACKGROUND TASK ERROR (Bet Status): No se encontró credenciales en '{FIREBASE_CRED_PATH}'. Abortando.")
                     return
             except ValueError:
-                 print(f"BACKGROUND TASK INFO (Bet Status): Firebase ya inicializado por otro hilo.")
-                 pass
+                print(f"BACKGROUND TASK INFO (Bet Status): Firebase ya inicializado por otro hilo.")
+                pass
             except Exception as init_error:
                 print(f"BACKGROUND TASK ERROR (Bet Status): Fallo al inicializar Firebase: {init_error}")
                 return
@@ -390,29 +556,21 @@ def send_fcm_bet_status_notification_task(user_id, fcm_token, race_name, porra_n
             print(f"BACKGROUND TASK (Bet Status): No hay token FCM para user {user_id}. Abortando.")
             return
 
-        # --- Construir Mensaje Específico ---
-        if new_status == 'ACEPTADA':
-            title = "✅ ¡Apuesta Aceptada!"
-            body = f"Tu apuesta para {race_name} en la porra '{porra_name}' ha sido aceptada."
-            icon = "✅" # Opcional: Podrías usar un icono específico si tu app lo soporta
-        else: # RECHAZADA
-            title = "❌ Apuesta Rechazada"
-            body = f"Tu apuesta para {race_name} en la porra '{porra_name}' ha sido rechazada. Puedes modificarla si la fecha límite no ha pasado."
-            icon = "❌"
+        # --- Construir Mensaje Multiidioma ---
+        lang = _pick_lang(lang)
+        title, body = _fcm_text('bet_status_update', lang,
+                                race=race_name, porra=porra_name,
+                                status=('ACEPTADA' if new_status == 'ACEPTADA' else 'RECHAZADA'))
 
         message = messaging.Message(
-            notification=messaging.Notification( title=title, body=body ),
+            notification=messaging.Notification(title=title, body=body),
             data={
-                'tipo_notificacion': 'bet_status_update', # <-- NUEVO TIPO
+                'tipo_notificacion': 'bet_status_update',
                 'race_name': race_name,
                 'porra_name': porra_name,
-                'new_status': new_status # 'ACEPTADA' o 'RECHAZADA'
-                # Podrías añadir id_porra y id_carrera si son útiles para la navegación
+                'new_status': new_status
             },
-            token=fcm_token,
-            # Opcional: Configuración Android/APNS para iconos, etc.
-            # android=messaging.AndroidConfig(notification=messaging.AndroidNotification(icon=icon...)),
-            # apns=messaging.APNSConfig(payload=messaging.APNSPayload(aps=messaging.Aps(badge=...)))
+            token=fcm_token
         )
         print(f"BACKGROUND TASK (Bet Status): Mensaje construido para token ...{fcm_token[-10:]}")
 
@@ -425,14 +583,13 @@ def send_fcm_bet_status_notification_task(user_id, fcm_token, race_name, porra_n
         print(f"ERROR: Código={fcm_api_error.code}, Mensaje='{fcm_api_error.message}'")
     except Exception as e:
         print(f"!!!!!!!! BACKGROUND TASK GENERAL ERROR (Bet Status) !!!!!!!!")
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
     finally:
         print(f"BACKGROUND TASK (Bet Status): Finalizado para user {user_id}, carrera '{race_name}'.")
-# --- FIN NUEVA Función ---
+
 
 # --- NUEVA Función para Notificación de Invitación a Porra ---
-def send_fcm_invitation_notification_task(user_id_invitado, fcm_token_invitado, porra_id, porra_name, nombre_invitador):
+def send_fcm_invitation_notification_task(user_id_invitado, fcm_token_invitado, porra_id, porra_name, nombre_invitador, lang='es'):
     """
     Tarea en background para enviar notificación FCM sobre una nueva invitación a porra.
     """
@@ -479,26 +636,19 @@ def send_fcm_invitation_notification_task(user_id_invitado, fcm_token_invitado, 
             print(f"BACKGROUND TASK (Porra Invitation): No hay token FCM para user {user_id_invitado}. Abortando.")
             return
 
-        # --- Construir Mensaje Específico ---
-        title = "👋 ¡Nueva Invitación a Porra!"
-        body = f"{nombre_invitador} te ha invitado a unirte a la porra '{porra_name}'. ¡Acepta y demuestra quién sabe más de F1!"
-        
+        # --- Construir Mensaje Multiidioma ---
+        lang = _pick_lang(lang)
+        title, body = _fcm_text('porra_invitation', lang, porra=porra_name, inviter=nombre_invitador)
+
         message = messaging.Message(
-            notification=messaging.Notification(
-                title=title,
-                body=body
-            ),
+            notification=messaging.Notification(title=title, body=body),
             data={
-                'tipo_notificacion': 'porra_invitation', # <-- NUEVO TIPO para que el frontend sepa qué hacer
+                'tipo_notificacion': 'porra_invitation',
                 'porra_id': str(porra_id),
                 'porra_name': porra_name,
                 'inviter_name': nombre_invitador
-                # Podrías añadir más datos si son útiles para la app al recibir la notificación
             },
             token=fcm_token_invitado,
-            # Opcional: Configuración Android/APNS para iconos, sonido personalizado, etc.
-            # android=messaging.AndroidConfig(notification=messaging.AndroidNotification(icon='stock_ticker_update'), priority='high'),
-            # apns=messaging.APNSConfig(payload=messaging.APNSPayload(aps=messaging.Aps(sound='default', category='INVITE_CATEGORY')))
         )
         print(f"BACKGROUND TASK (Porra Invitation): Mensaje construido para token ...{fcm_token_invitado[-10:]}")
 
@@ -529,7 +679,7 @@ def send_fcm_invitation_notification_task(user_id_invitado, fcm_token_invitado, 
 # --- FIN NUEVA Función ---
 
 # --- NUEVA Función para Notificación de Resultado Listo ---
-def send_fcm_result_notification_task(user_id, fcm_token, race_name, porra_id):
+def send_fcm_result_notification_task(user_id, fcm_token, race_name, porra_id, lang='es'):
     """
     Tarea que se ejecuta en background para enviar notificación FCM
     cuando un resultado de carrera está listo.
@@ -566,17 +716,15 @@ def send_fcm_result_notification_task(user_id, fcm_token, race_name, porra_id):
             return
 
         # Construir el mensaje específico para resultado listo
+        lang = _pick_lang(lang)
+        title, body = _fcm_text('result_ready', lang, race=race_name)
+
         message = messaging.Message(
-            notification=messaging.Notification(
-                title="🏁 ¡Resultado Disponible!",
-                body=f"¡Ya puedes consultar el resultado y tus puntos para {race_name}!"
-            ),
+            notification=messaging.Notification(title=title, body=body),
             data={
-                'tipo_notificacion': 'result_ready', # <-- NUEVO TIPO
+                'tipo_notificacion': 'result_ready',
                 'race_name': race_name,
-                'porra_id': str(porra_id) # <-- AÑADIR ID PORRA (como string)
-                # Podrías añadir id_carrera si fuese útil para la navegación
-                # 'id_carrera': str(id_carrera)
+                'porra_id': str(porra_id)
             },
             token=fcm_token,
         )
@@ -599,7 +747,7 @@ def send_fcm_result_notification_task(user_id, fcm_token, race_name, porra_id):
 # --- FIN NUEVA Función ---
 
 # --- NUEVA Función para Notificación de Próxima Carrera Disponible ---
-def send_fcm_next_race_notification_task(user_id, fcm_token, current_race_name, next_race_name, porra_id, next_race_id):
+def send_fcm_next_race_notification_task(user_id, fcm_token, current_race_name, next_race_name, porra_id, next_race_id, lang='es'):
     """
     Tarea que se ejecuta en background para enviar notificación FCM
     cuando la siguiente carrera está disponible para apostar.
@@ -635,17 +783,17 @@ def send_fcm_next_race_notification_task(user_id, fcm_token, current_race_name, 
             return
 
         # Construir el mensaje específico para próxima carrera
+        lang = _pick_lang(lang)
+        title, body = _fcm_text('next_race_available', lang, current=current_race_name, next=next_race_name)
+
         message = messaging.Message(
-            notification=messaging.Notification(
-                title="🚀 ¡Próxima Carrera Abierta!",
-                body=f"Resultados de {current_race_name} listos. ¡Ya puedes apostar para {next_race_name}!"
-            ),
+            notification=messaging.Notification(title=title, body=body),
             data={
-                'tipo_notificacion': 'next_race_available', # <-- NUEVO TIPO
+                'tipo_notificacion': 'next_race_available',
                 'current_race_name': current_race_name,
                 'next_race_name': next_race_name,
-                'porra_id': str(porra_id), # ID de la porra
-                'next_race_id': str(next_race_id) # ID de la SIGUIENTE carrera
+                'porra_id': str(porra_id),
+                'next_race_id': str(next_race_id)
             },
             token=fcm_token,
         )
@@ -668,7 +816,7 @@ def send_fcm_next_race_notification_task(user_id, fcm_token, current_race_name, 
 # --- FIN NUEVA Función ---
 
 # --- send_fcm_betting_closed_notification_task MODIFICADA (v2 - genérica por carrera) ---
-def send_fcm_betting_closed_notification_task(user_id, fcm_token, race_id, race_name, ano_carrera):
+def send_fcm_betting_closed_notification_task(user_id, fcm_token, race_id, race_name, ano_carrera, lang='es'):
     """
     Tarea en background para enviar notificación FCM genérica cuando las apuestas para una carrera han cerrado.
     """
@@ -705,17 +853,16 @@ def send_fcm_betting_closed_notification_task(user_id, fcm_token, race_id, race_
             print(f"BACKGROUND TASK (Betting Closed - Generic): No hay token FCM para user {user_id}. Abortando.")
             return
 
-        title = "🔒 ¡Apuestas Cerradas!"
-        body = f"Las apuestas para {race_name} han cerrado. ¡Ya puedes comparar con otros miembros!" # Mensaje genérico
+        lang = _pick_lang(lang)
+        title, body = _fcm_text('betting_closed', lang, race=race_name)
 
         message = messaging.Message(
             notification=messaging.Notification(title=title, body=body),
             data={
-                'tipo_notificacion': 'betting_closed', 
+                'tipo_notificacion': 'betting_closed',
                 'race_id': str(race_id),
                 'race_name': race_name,
-                'ano_carrera': str(ano_carrera) # Añadido para posible uso en frontend
-                # Ya no se envían porra_id ni porra_name específicos
+                'ano_carrera': str(ano_carrera)
             },
             token=fcm_token
         )
@@ -798,7 +945,7 @@ def check_betting_closed_and_notify():
             # Obtener todos los participantes de TODAS las porras de ese año
             # que tengan token FCM y que estén activos.
             sql_all_participants_year_with_tokens = """
-                SELECT DISTINCT u.id_usuario, u.fcm_token
+                SELECT DISTINCT u.id_usuario, u.fcm_token, u.language_code
                 FROM usuario u
                 JOIN participacion pa ON u.id_usuario = pa.id_usuario
                 JOIN porra po ON pa.id_porra = po.id_porra
@@ -818,20 +965,22 @@ def check_betting_closed_and_notify():
             for user_data in all_relevant_users_with_tokens:
                 user_id = user_data['id_usuario']
                 fcm_token = user_data['fcm_token']
+                user_lang = (user_data.get('language_code') or 'es').strip().lower()
                 if user_id not in unique_users_to_notify_for_race: # Asegurar unicidad
-                    unique_users_to_notify_for_race[user_id] = fcm_token
+                    unique_users_to_notify_for_race[user_id] = {"token": fcm_token, "lang": user_lang}
             
             if unique_users_to_notify_for_race:
                 print(f"  TAREA CIERRE: Enviando notificación de cierre de apuestas para '{desc_carrera}' a {len(unique_users_to_notify_for_race)} usuarios únicos.")
-                for user_id, token in unique_users_to_notify_for_race.items():
+                for user_id, info in unique_users_to_notify_for_race.items():
                     try:
                         thread_pool_executor.submit(
                             send_fcm_betting_closed_notification_task, # La versión genérica
                             user_id,
-                            token,
+                            info["token"],
                             id_carrera,
                             desc_carrera,
-                            ano_carrera # Pasamos año en lugar de porra_id/porra_name
+                            ano_carrera, # Pasamos año en lugar de porra_id/porra_name
+                            info["lang"]
                         )
                     except Exception as submit_err:
                         print(f"!!!!!!!! TAREA CIERRE ERROR SUBMIT (Generic): User {user_id}, Carrera {id_carrera}. Error: {submit_err} !!!!!!!!!!")
@@ -856,7 +1005,7 @@ def check_betting_closed_and_notify():
 
 # --- FIN Nueva Función ---
 
-def send_fcm_notification_task(user_id, fcm_token, trofeo_codigo, trofeo_nombre, trofeo_desc):
+def send_fcm_notification_task(user_id, fcm_token, trofeo_codigo, trofeo_nombre, trofeo_desc, lang='es'):
     """Tarea que se ejecuta en background para enviar notificación FCM."""
     print(f"BACKGROUND TASK: Iniciando envío FCM para user {user_id}, trofeo '{trofeo_codigo}'...")
     try:
@@ -890,13 +1039,21 @@ def send_fcm_notification_task(user_id, fcm_token, trofeo_codigo, trofeo_nombre,
 
         # Ya no necesitas la comprobación explícita de _apps aquí si la inicialización anterior funciona
 
+        # --- Construir Mensaje (multiidioma) ---
+        lang = _pick_lang(lang)
+        # Priorizamos el nombre del trofeo; si no hay, caemos al código
+        trophy_label = (trofeo_nombre or trofeo_codigo or "").strip()
+        title, body = _fcm_text('trophy_unlocked', lang, trophy=trophy_label)
+
         message = messaging.Message(
-             notification=messaging.Notification(
-                 title=f"🏆 ¡Trofeo Desbloqueado! 🎉",
-                 body=f"¡Has conseguido el trofeo '{trofeo_nombre}'!"
-             ),
-             data={ 'tipo_notificacion': 'trofeo_conseguido', 'trofeo_codigo': trofeo_codigo, 'trofeo_nombre': trofeo_nombre, 'trofeo_descripcion': trofeo_desc, },
-             token=fcm_token,
+            notification=messaging.Notification(title=title, body=body),
+            data={
+                'tipo_notificacion': 'trophy_unlocked',
+                'trofeo_codigo': str(trofeo_codigo or ''),
+                'trofeo_nombre': trofeo_nombre or "",
+                'trofeo_desc': trofeo_desc or ""
+            },
+            token=fcm_token
         )
         print(f"BACKGROUND TASK: Mensaje construido. Llamando a messaging.send() para token ...{fcm_token[-10:]}")
 
@@ -1075,38 +1232,45 @@ def _award_trophy(user_id, trofeo_codigo, conn, cur, detalles=None):
 
         # --- Lógica de Notificación FCM ASÍNCRONA ---
         fcm_token = None
+        user_lang = 'es'
         try:
-            # Obtener token FCM del usuario
-            print(f"DEBUG [_award_trophy]: Querying FCM token for user {user_id}...")
-            cur.execute("SELECT fcm_token FROM usuario WHERE id_usuario = %s;", (user_id,))
-            user_fcm_row = cur.fetchone()
+            # Obtener token FCM y language_code del usuario
+            print(f"DEBUG [_award_trophy]: Querying FCM token + language_code for user {user_id}...")
+            cur.execute("SELECT fcm_token, language_code FROM usuario WHERE id_usuario = %s;", (user_id,))
+            user_row = cur.fetchone()
 
-            if user_fcm_row and user_fcm_row.get('fcm_token') and user_fcm_row['fcm_token'].strip(): # Asegurar que no está vacío
-                fcm_token = user_fcm_row['fcm_token'].strip()
-                print(f"DEBUG [_award_trophy]: Token FCM encontrado para user {user_id}: ...{fcm_token[-10:]}") # Mostrar últimos 10 chars
+            if user_row and user_row.get('fcm_token') and (user_row['fcm_token'] or '').strip():
+                fcm_token = user_row['fcm_token'].strip()
+                user_lang = (user_row.get('language_code') or 'es').strip().lower()
+                print(f"DEBUG [_award_trophy]: Token FCM ok (...{fcm_token[-10:]}) y lang='{user_lang}' para user {user_id}.")
             else:
-                print(f"WARN [_award_trophy]: No se encontró token FCM válido para el usuario {user_id}. No se enviará notificación.")
+                print(f"WARN [_award_trophy]: No hay token FCM válido para el usuario {user_id}. No se enviará notificación.")
 
             # Si tenemos token, ENVIAMOS LA TAREA al executor
             if fcm_token:
-                print(f"DEBUG [_award_trophy]: Preparando para enviar tarea FCM al executor para user {user_id}, trofeo '{trofeo_codigo}'...")
-                # Acceder al executor estándar global
+                print(f"DEBUG [_award_trophy]: Enviando tarea FCM (trofeo) al executor para user {user_id}, trofeo '{trofeo_codigo}'...")
                 global thread_pool_executor
                 if thread_pool_executor is None:
-                     print(f"!!!!!!!! ERROR CRÍTICO [_award_trophy]: ¡¡ThreadPoolExecutor no está inicializado!! No se puede enviar tarea FCM. !!!!!!!!!!")
+                    print(f"!!!!!!!! ERROR CRÍTICO [_award_trophy]: El executor global no está inicializado!! No se puede enviar tarea FCM. !!!!!!!!!!")
                 else:
-                    # Pasar todos los datos necesarios a la función de tarea
-                    # *** Asegúrate que 'send_fcm_notification_task' existe y acepta estos args ***
-                    thread_pool_executor.submit(send_fcm_notification_task, user_id, fcm_token, trofeo_codigo, trofeo_nombre, trofeo_desc)
+                    # *** Ahora la tarea acepta 'lang' como último parámetro ***
+                    thread_pool_executor.submit(
+                        send_fcm_notification_task,
+                        user_id,
+                        fcm_token,
+                        trofeo_codigo,
+                        trofeo_nombre,
+                        trofeo_desc,
+                        user_lang  # <-- AÑADIDO
+                    )
                     print(f"DEBUG [_award_trophy]: Tarea FCM enviada al executor (se ejecutará en background).")
             else:
                 print(f"DEBUG [_award_trophy]: No se envía tarea FCM (no hay token).")
 
         except Exception as e_fcm_logic:
             # Error al obtener token o al hacer submit (no al ejecutar la tarea)
-            print(f"ERROR [_award_trophy]: Excepción en lógica PREVIA al envío de tarea FCM para user {user_id}. Error: {e_fcm_logic}")
-            import traceback
-            traceback.print_exc() # Imprimir stack trace para más detalles
+            print(f"ERROR [_award_trophy]: Excepción en lógica FCM previo al envío de tarea FCM para user {user_id}. Error: {e_fcm_logic}")
+            import traceback; traceback.print_exc()
         # --- FIN Lógica de Notificación ---
 
         print(f"--- FN: _award_trophy --- END (Trofeo otorgado)\n")
@@ -2421,7 +2585,12 @@ def actualizar_resultado_carrera(id_carrera):
             if participants_to_notify_result:
                  user_ids_to_notify_list_res = list(participants_to_notify_result)
                  placeholders_res = ','.join(['%s'] * len(user_ids_to_notify_list_res))
-                 sql_get_tokens_res = f"SELECT id_usuario, fcm_token FROM usuario WHERE id_usuario IN ({placeholders_res}) AND fcm_token IS NOT NULL AND fcm_token != '';"
+                 sql_get_tokens_res = f"""
+                    SELECT id_usuario, fcm_token, language_code
+                    FROM usuario
+                    WHERE id_usuario IN ({placeholders_res})
+                      AND fcm_token IS NOT NULL AND fcm_token != '';
+                """
                  cur.execute(sql_get_tokens_res, tuple(user_ids_to_notify_list_res))
                  tokens_to_send_res = cur.fetchall()
                  if tokens_to_send_res:
@@ -2431,8 +2600,9 @@ def actualizar_resultado_carrera(id_carrera):
                         submitted_count_res = 0
                         for token_row in tokens_to_send_res:
                             user_id = token_row['id_usuario']; token = token_row['fcm_token']
+                            user_lang = (token_row.get('language_code') or 'es').strip().lower()
                             try:
-                                thread_pool_executor.submit(send_fcm_result_notification_task, user_id, token, desc_carrera, id_porra_actual)
+                                thread_pool_executor.submit(send_fcm_result_notification_task, user_id, token, desc_carrera, id_porra_actual, user_lang)
                                 users_notified_about_result.add(user_id); submitted_count_res += 1
                             except Exception as submit_err: print(f"!!!!!!!! ERROR [Notif Resultado]: Fallo al hacer submit para user {user_id}. Error: {submit_err} !!!!!!!!!!")
                         print(f"DEBUG: Enviadas {submitted_count_res} tareas de notificación de resultado al executor para porra {id_porra_actual}.")
@@ -2443,7 +2613,12 @@ def actualizar_resultado_carrera(id_carrera):
                 print(f"DEBUG: Preparando notificación 'Next Race Available' para carrera '{next_race_name}' (ID: {next_race_id}).")
                 user_ids_to_notify_list_next = list(participants_to_notify_next_race)
                 placeholders_next = ','.join(['%s'] * len(user_ids_to_notify_list_next))
-                sql_get_tokens_next = f"SELECT id_usuario, fcm_token FROM usuario WHERE id_usuario IN ({placeholders_next}) AND fcm_token IS NOT NULL AND fcm_token != '';"
+                sql_get_tokens_next = f"""
+                    SELECT id_usuario, fcm_token, language_code
+                    FROM usuario
+                    WHERE id_usuario IN ({placeholders_next})
+                      AND fcm_token IS NOT NULL AND fcm_token != '';
+                """
                 cur.execute(sql_get_tokens_next, tuple(user_ids_to_notify_list_next))
                 tokens_to_send_next = cur.fetchall()
                 if tokens_to_send_next:
@@ -2452,8 +2627,9 @@ def actualizar_resultado_carrera(id_carrera):
                         submitted_count_next = 0
                         for token_row in tokens_to_send_next:
                             user_id = token_row['id_usuario']; token = token_row['fcm_token']
+                            user_lang = (token_row.get('language_code') or 'es').strip().lower()
                             try:
-                                thread_pool_executor.submit( send_fcm_next_race_notification_task, user_id, token, desc_carrera, next_race_name, id_porra_actual, next_race_id )
+                                thread_pool_executor.submit( send_fcm_next_race_notification_task, user_id, token, desc_carrera, next_race_name, id_porra_actual, next_race_id, user_lang )
                                 users_notified_about_next_race.add(user_id)
                                 submitted_count_next += 1
                             except Exception as submit_err: print(f"!!!!!!!! ERROR [Notif Next Race]: Fallo al hacer submit para user {user_id}. Error: {submit_err} !!!!!!!!!!")
@@ -2996,7 +3172,7 @@ def invitar_usuario_porra(id_porra):
              return jsonify({"error": "Solo el creador puede enviar invitaciones para esta porra"}), 403
 
         # 2. Buscar al usuario invitado por NOMBRE y obtener su fcm_token
-        cur.execute("SELECT id_usuario, nombre, fcm_token FROM usuario WHERE nombre = %s;", (nombre_invitado,))
+        cur.execute("SELECT id_usuario, nombre, fcm_token, language_code FROM usuario WHERE nombre = %s;", (nombre_invitado,))
         usuario_invitado_data = cur.fetchone()
 
         if not usuario_invitado_data:
@@ -3005,6 +3181,7 @@ def invitar_usuario_porra(id_porra):
         id_usuario_invitado = usuario_invitado_data['id_usuario']
         nombre_usuario_invitado_confirmado = usuario_invitado_data['nombre']
         fcm_token_invitado = usuario_invitado_data.get('fcm_token') # Puede ser None
+        user_lang = (usuario_invitado_data.get('language_code') or 'es').strip().lower()
 
         # 3. Validaciones adicionales
         if id_usuario_invitado == id_token_int:
@@ -3034,7 +3211,8 @@ def invitar_usuario_porra(id_porra):
                     fcm_token_invitado,
                     id_porra,
                     nombre_porra_actual,
-                    nombre_invitador # Nombre del usuario que hace la invitación (creador)
+                    nombre_invitador, # Nombre del usuario que hace la invitación (creador)
+                    user_lang  
                 )
                 print(f"DEBUG [Invitar Usuario]: Tarea de notificación de invitación FCM enviada al executor.")
             else:
@@ -4925,14 +5103,15 @@ def responder_apuesta_pendiente(id_apuesta):
         # 1. Obtener detalles apuesta, porra, usuario APOSTADOR y carrera
         sql_get_info = """
             SELECT
-                a.id_usuario, a.id_carrera, a.estado_apuesta, -- Datos apuesta y usuario apostador
-                p.id_porra, p.nombre_porra, p.id_creador, p.tipo_porra, -- Datos porra
-                c.desc_carrera, -- Datos carrera
-                u.fcm_token -- Token del APOSTADOR
+                a.id_usuario, a.id_carrera, a.estado_apuesta,
+                p.id_porra, p.nombre_porra, p.id_creador, p.tipo_porra,
+                c.desc_carrera,
+                u.fcm_token,
+                u.language_code
             FROM apuesta a
             JOIN porra p ON a.id_porra = p.id_porra
             JOIN carrera c ON a.id_carrera = c.id_carrera
-            JOIN usuario u ON a.id_usuario = u.id_usuario -- JOIN con usuario APOSTADOR
+            JOIN usuario u ON a.id_usuario = u.id_usuario
             WHERE a.id_apuesta = %s;
             """
         cur.execute(sql_get_info, (id_apuesta,))
@@ -4963,6 +5142,7 @@ def responder_apuesta_pendiente(id_apuesta):
 
         if fcm_token_apostador and id_usuario_apostador:
             print(f"DEBUG [Responder Apuesta]: Intentando enviar notif '{nuevo_estado}' a user {id_usuario_apostador}...")
+            user_lang = (info.get('language_code') or 'es').strip().lower()
             global thread_pool_executor
             if thread_pool_executor:
                  thread_pool_executor.submit(
@@ -4971,7 +5151,8 @@ def responder_apuesta_pendiente(id_apuesta):
                      fcm_token_apostador,
                      nombre_carrera,
                      nombre_porra,
-                     nuevo_estado # 'ACEPTADA' o 'RECHAZADA'
+                     nuevo_estado, # 'ACEPTADA' o 'RECHAZADA'
+                     user_lang   
                  )
                  print(f"DEBUG [Responder Apuesta]: Tarea FCM ({nuevo_estado}) enviada al executor.")
             else:
