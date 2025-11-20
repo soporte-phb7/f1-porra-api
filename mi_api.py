@@ -13,12 +13,22 @@ import firebase_admin
 from firebase_admin import exceptions as firebase_exceptions
 from firebase_admin import credentials
 from firebase_admin import messaging # Es probable que también necesites esto
+from firebase_admin import storage # Es probable que también necesites esto
 from flask_executor import Executor # <-- Añadir importación
 from apscheduler.schedulers.background import BackgroundScheduler # <-- Añadir
 from apscheduler.triggers.interval import IntervalTrigger       # <-- Añadir
 import atexit                                                   # <-- Añadir (para apagar scheduler)
 import logging                                                  # <-- Añadir (para logs del scheduler)
 import concurrent.futures # <-- AÑADIR
+import requests  # Para llamar a la API de Jolpica / Ergast
+import uuid # Para nombres de archivo únicos
+import urllib.request
+import ssl
+import subprocess
+import tempfile
+from curl_cffi import requests as cffi_requests # Importamos esto para la descarga potente
+import base64
+import urllib.parse # Para codificar el texto del prompt
 
 # Configurar logging para ver mensajes de APScheduler (opcional pero útil)
 logging.basicConfig(level=logging.INFO)
@@ -58,9 +68,10 @@ try:
         # --- Añadir projectId explícitamente ---
         firebase_admin.initialize_app(cred, {
             'projectId': FIREBASE_PROJECT_ID,
+            'storageBucket': 'f1-porra-app-links.firebasestorage.app' # <-- AÑADE ESTO
         })
         # Añadimos log con el Project ID usado
-        print(f"INFO: Firebase Admin SDK inicializado correctamente para proyecto '{FIREBASE_PROJECT_ID}'.")
+        print(f"INFO: Firebase Admin SDK con storage inicializado correctamente para proyecto '{FIREBASE_PROJECT_ID}'.")
     else:
         print(f"ERROR: No se encontró el archivo de credenciales Firebase en '{FIREBASE_CRED_PATH}'")
 except Exception as e:
@@ -95,6 +106,136 @@ else:
      DB_USER = os.environ.get("DB_USER", "postgres")
      DB_PASS = os.environ.get("DB_PASS", "tu_contraseña") # ¡Importante!
      DB_PORT = int(os.environ.get("DB_PORT", 5432))
+
+# --- Configuración Jolpica / Ergast F1 (NUEVO) ---
+
+JOLPICA_BASE_URL = os.environ.get("JOLPICA_BASE_URL", "https://api.jolpi.ca/ergast/f1")
+JOLPICA_TIMEOUT = int(os.environ.get("JOLPICA_TIMEOUT", 5))  # segundos
+JOLPICA_STANDINGS_CACHE_TTL_MIN = int(os.environ.get("JOLPICA_STANDINGS_CACHE_TTL_MIN", 30))  # minutos
+
+
+class JolpicaError(Exception):
+    """Error genérico para problemas al llamar a Jolpica / Ergast."""
+    pass
+
+
+def _safe_int(value, default=None):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _jolpica_get(path):
+    """
+    Llama a Jolpica (API Ergast) y devuelve el JSON ya parseado.
+    Lanza JolpicaError si hay problema de red, código HTTP != 200 o JSON inválido.
+    """
+    url = f"{JOLPICA_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
+    try:
+        resp = requests.get(url, timeout=JOLPICA_TIMEOUT)
+    except requests.RequestException as exc:
+        print(f"JOLPICA ERROR: Error de red llamando a {url}: {exc}")
+        raise JolpicaError("Error de red llamando a Jolpica") from exc
+
+    if resp.status_code != 200:
+        # Logueamos algo de la respuesta para debug
+        body_preview = resp.text[:500]
+        print(f"JOLPICA ERROR: Código {resp.status_code} desde {url}. Cuerpo: {body_preview}")
+        raise JolpicaError(f"Respuesta {resp.status_code} desde Jolpica")
+
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        print(f"JOLPICA ERROR: JSON inválido desde {url}: {exc}")
+        raise JolpicaError("Respuesta JSON inválida desde Jolpica") from exc
+
+    return data
+
+
+def _parse_driver_standings(ergast_json):
+    """
+    Recibe el JSON tal cual de Ergast y devuelve una lista simplificada de pilotos:
+    [
+      {
+        "position": 1,
+        "points": 175,
+        "wins": 6,
+        "driverCode": "VER",
+        "driverName": "Max Verstappen",
+        "constructorName": "Red Bull Racing"
+      },
+      ...
+    ]
+    """
+    mrdata = ergast_json.get("MRData", {})
+    standings_table = mrdata.get("StandingsTable", {})
+    lists = standings_table.get("StandingsLists", [])
+    if not lists:
+        return []
+
+    driver_standings = lists[0].get("DriverStandings", []) or []
+    simplified = []
+
+    for item in driver_standings:
+        driver = item.get("Driver", {}) or {}
+        constructors = item.get("Constructors", []) or []
+
+        code = driver.get("code") or driver.get("permanentNumber") or driver.get("driverId")
+        given = driver.get("givenName", "") or ""
+        family = driver.get("familyName", "") or ""
+        full_name = f"{given} {family}".strip()
+
+        constructor_name = constructors[0].get("name") if constructors else None
+
+        simplified.append({
+            "position": _safe_int(item.get("position")),
+            "points": _safe_int(item.get("points")),
+            "wins": _safe_int(item.get("wins"), 0),
+            "driverCode": code,
+            "driverName": full_name,
+            "constructorName": constructor_name,
+        })
+
+    return simplified
+
+
+def _parse_constructor_standings(ergast_json):
+    """
+    Devuelve una lista simplificada de constructores:
+    [
+      {
+        "position": 1,
+        "points": 250,
+        "wins": 8,
+        "constructorName": "Red Bull Racing",
+        "constructorId": "red_bull"
+      },
+      ...
+    ]
+    """
+    mrdata = ergast_json.get("MRData", {})
+    standings_table = mrdata.get("StandingsTable", {})
+    lists = standings_table.get("StandingsLists", [])
+    if not lists:
+        return []
+
+    constructor_standings = lists[0].get("ConstructorStandings", []) or []
+    simplified = []
+
+    for item in constructor_standings:
+        constructor = item.get("Constructor", {}) or {}
+
+        simplified.append({
+            "position": _safe_int(item.get("position")),
+            "points": _safe_int(item.get("points")),
+            "wins": _safe_int(item.get("wins"), 0),
+            "constructorName": constructor.get("name"),
+            "constructorId": constructor.get("constructorId"),
+        })
+
+    return simplified
+
 # Crea la aplicación Flask
 app = Flask(__name__)
 
@@ -283,7 +424,381 @@ def _fcm_text(kind: str, lang: str, **kwargs):
     return title, body_tpl.format(**kwargs)
 # ======= fin i18n =======
 
+# --- Funciones de caché en PostgreSQL para clasificaciones F1 (NUEVO) ---
 
+def _get_driver_standings_cache(season="current"):
+    """
+    Lee de la tabla f1_driver_standings.
+    Devuelve un diccionario con season, last_updated (datetime) e items (lista de filas),
+    o None si no hay registro.
+    """
+    conn = None
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            database=DB_NAME,
+            user=DB_USER,
+            password=DB_PASS
+        )
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute(
+            "SELECT season, last_updated, payload FROM f1_driver_standings WHERE season = %s;",
+            (season,)
+        )
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+
+        payload = row["payload"]
+        # Si por algún motivo psycopg2 devolviera texto, intentamos parsear a JSON
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                print(f"WARNING: payload de f1_driver_standings no es JSON válido para season={season}")
+                payload = []
+
+        return {
+            "season": row["season"],
+            "last_updated": row["last_updated"],
+            "items": payload,
+        }
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"ERROR en _get_driver_standings_cache: {error}")
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def upload_base64_to_firebase(b64_string):
+    print("Procesando imagen recibida en Base64...")
+    try:
+        # Limpiar cabecera si viene (ej: "data:image/png;base64,...")
+        if "," in b64_string:
+            b64_string = b64_string.split(",")[1]
+
+        # Decodificar
+        image_data = base64.b64decode(b64_string)
+
+        # Subir a Firebase
+        bucket = storage.bucket()
+        filename = f"noticias/news_{uuid.uuid4()}.png"
+        blob = bucket.blob(filename)
+
+        blob.upload_from_string(image_data, content_type='image/png')
+        blob.make_public()
+
+        print(f"Imagen Base64 subida a Firebase: {blob.public_url}")
+        return blob.public_url
+    except Exception as e:
+        print(f"Error procesando Base64: {e}")
+        return None
+
+# --- Función auxiliar para subir imagen desde URL a Firebase Storage ---
+
+# --- REEMPLAZAR ESTA FUNCIÓN EN mi_api.py ---
+def upload_image_to_firebase(image_url):
+    print(f"Descargando imagen (vía curl_cffi - Chrome Impersonation): {image_url}")
+    
+    # Imagen de respaldo (Logo genérico)
+    FALLBACK_IMAGE = "https://upload.wikimedia.org/wikipedia/commons/thumb/3/33/F1.svg/1200px-F1.svg.png"
+
+    try:
+        # Usamos curl_cffi para imitar un navegador real (Chrome 120).
+        # Esto evita el error 403 (firma rota) y el 409 (bloqueo de bot).
+        response = cffi_requests.get(
+            image_url,
+            impersonate="chrome120", # <--- La clave: nos hacemos pasar por Chrome
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            print(f"Descarga OK ({len(response.content)} bytes). Subiendo a Firebase...")
+            
+            # Subir a Firebase Storage
+            bucket = storage.bucket()
+            filename = f"noticias/news_{uuid.uuid4()}.png"
+            blob = bucket.blob(filename)
+            
+            # Subir el contenido binario
+            blob.upload_from_string(response.content, content_type='image/png')
+            blob.make_public()
+            
+            public_url = blob.public_url
+            print(f"Imagen subida a Firebase correctamente: {public_url}")
+            return public_url
+            
+        else:
+            print(f"Error descarga curl_cffi: Status {response.status_code}")
+            return FALLBACK_IMAGE
+
+    except Exception as e:
+        print(f"!!!!!!!! EXCEPCIÓN EN UPLOAD (curl_cffi): {e}")
+        return FALLBACK_IMAGE
+
+# --- Tarea de notificación en background (reutilizada y simplificada) ---
+def send_fcm_news_notification_task(news_data):
+    """
+    Envía notificaciones push personalizadas por idioma.
+    TÍTULO: Texto genérico (ej: "¡Nueva Noticia!")
+    CUERPO: El titular de la noticia.
+    """
+    print(f"BACKGROUND TASK (News): Iniciando envío multilingüe...")
+
+    # Diccionario de títulos genéricos
+    GENERIC_TITLES = {
+        'es': "📰 ¡Nueva noticia F1!",
+        'en': "📰 New F1 News!",
+        'fr': "📰 Nouvelle actualité F1 !",
+        'pt': "📰 Nova notícia F1!",
+        'ca': "📰 Nova notícia F1!"
+    }
+    
+    try:
+        # 1. Conectar a BD y obtener tokens E IDIOMA
+        conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
+        cur = conn.cursor()
+        # IMPORTANTE: Seleccionamos también language_code
+        cur.execute("SELECT fcm_token, language_code FROM usuario WHERE fcm_token IS NOT NULL AND fcm_token != '';")
+        users_raw = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        if not users_raw:
+            print("BACKGROUND TASK (News): No hay usuarios suscritos.")
+            return
+
+        print(f"BACKGROUND TASK (News): Procesando {len(users_raw)} usuarios.")
+
+        # 2. Asegurar instancia de Firebase
+        try:
+            app = firebase_admin.get_app()
+        except ValueError:
+            cred = credentials.Certificate(FIREBASE_CRED_PATH)
+            bucket_name = os.environ.get('FIREBASE_BUCKET_NAME', 'f1-porra-app-links.firebasestorage.app') 
+            app = firebase_admin.initialize_app(cred, {
+                'projectId': FIREBASE_PROJECT_ID,
+                'storageBucket': bucket_name
+            })
+
+        # 3. Bucle de envío personalizado
+        enviados = 0
+        errores = 0
+
+        for row in users_raw:
+            token = row[0]
+            # Si language_code es null o vacío, usamos 'es' por defecto
+            user_lang = (row[1] or 'es').strip().lower()
+            
+            # A) TÍTULO GENÉRICO según idioma
+            notification_title = GENERIC_TITLES.get(user_lang, GENERIC_TITLES['es'])
+            
+            # B) CUERPO DE LA NOTIFICACIÓN = TITULAR DE LA NOTICIA
+            # Buscamos keys como 'titulo_en', 'titulo_fr', etc. Fallback a 'titulo_es'.
+            news_headline_key = f'titulo_{user_lang}'
+            notification_body = news_data.get(news_headline_key) or news_data.get('titulo_es') or "Nueva Noticia F1"
+            
+            try:
+                message = messaging.Message(
+                    notification=messaging.Notification(
+                        title=notification_title, # Ej: "📰 ¡Nueva noticia F1!"
+                        body=notification_body,   # Ej: "Alonso renueva con Aston Martin"
+                    ),
+                    data={
+                        'tipo_notificacion': 'nueva_noticia', # Esto es clave para Flutter
+                        'click_action': 'FLUTTER_NOTIFICATION_CLICK'
+                    },
+                    token=token
+                )
+                messaging.send(message, app=app)
+                enviados += 1
+            except Exception as e:
+                errores += 1
+                # print(f"Fallo token {user_lang}: {e}") # Descomentar para debug
+
+        print(f"BACKGROUND TASK (News): Finalizado. Enviados: {enviados}, Errores: {errores}")
+
+    except Exception as e:
+        print(f"!!!!!!!! ERROR BACKGROUND TASK (News) !!!!!!!!")
+        print(e)
+        import traceback
+        traceback.print_exc()
+
+def _save_driver_standings_cache(season, items):
+    """
+    Guarda (upsert) en la tabla f1_driver_standings.
+    """
+    conn = None
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            database=DB_NAME,
+            user=DB_USER,
+            password=DB_PASS
+        )
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO f1_driver_standings (season, last_updated, payload)
+            VALUES (%s, NOW(), %s)
+            ON CONFLICT (season) DO UPDATE
+            SET last_updated = EXCLUDED.last_updated,
+                payload = EXCLUDED.payload;
+            """,
+            (season, psycopg2.extras.Json(items))
+        )
+        conn.commit()
+        cur.close()
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"ERROR en _save_driver_standings_cache: {error}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _get_constructor_standings_cache(season="current"):
+    """
+    Lee de la tabla f1_constructor_standings.
+    """
+    conn = None
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            database=DB_NAME,
+            user=DB_USER,
+            password=DB_PASS
+        )
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute(
+            "SELECT season, last_updated, payload FROM f1_constructor_standings WHERE season = %s;",
+            (season,)
+        )
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+
+        payload = row["payload"]
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                print(f"WARNING: payload de f1_constructor_standings no es JSON válido para season={season}")
+                payload = []
+
+        return {
+            "season": row["season"],
+            "last_updated": row["last_updated"],
+            "items": payload,
+        }
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"ERROR en _get_constructor_standings_cache: {error}")
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _save_constructor_standings_cache(season, items):
+    """
+    Guarda (upsert) en la tabla f1_constructor_standings.
+    """
+    conn = None
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            database=DB_NAME,
+            user=DB_USER,
+            password=DB_PASS
+        )
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO f1_constructor_standings (season, last_updated, payload)
+            VALUES (%s, NOW(), %s)
+            ON CONFLICT (season) DO UPDATE
+            SET last_updated = EXCLUDED.last_updated,
+                payload = EXCLUDED.payload;
+            """,
+            (season, psycopg2.extras.Json(items))
+        )
+        conn.commit()
+        cur.close()
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"ERROR en _save_constructor_standings_cache: {error}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _is_cache_fresh(last_updated):
+    """
+    Devuelve True si last_updated es reciente según JOLPICA_STANDINGS_CACHE_TTL_MIN.
+    """
+    if not last_updated:
+        return False
+    try:
+        # En BD ya guardamos timestamptz, así que debería ser datetime con tz
+        if last_updated.tzinfo is None:
+            last_updated_utc = last_updated.replace(tzinfo=timezone.utc)
+        else:
+            last_updated_utc = last_updated.astimezone(timezone.utc)
+        age = datetime.now(timezone.utc) - last_updated_utc
+        return age <= timedelta(minutes=JOLPICA_STANDINGS_CACHE_TTL_MIN)
+    except Exception as exc:
+        print(f"WARNING: No se pudo calcular la frescura de caché: {exc}")
+        return False
+
+# --- Job APScheduler: sincronizar clasificaciones F1 con Jolpica (NUEVO) ---
+
+def sync_f1_standings_job():
+    """
+    Job periódico para sincronizar la clasificación de pilotos y constructores
+    desde Jolpica/Ergast y guardar en la caché (tablas f1_*_standings).
+
+    Se asume que se ejecuta en background via APScheduler.
+    """
+    print(f"\n--- JOB F1_STANDINGS: Inicio sync_f1_standings_job ({datetime.now(timezone.utc).isoformat()}) ---")
+    season = "current"
+
+    try:
+        # --- Pilotos ---
+        print("JOB F1_STANDINGS: Obteniendo clasificación de PILOTOS desde Jolpica...")
+        driver_path = "current/driverStandings.json"
+        raw_drivers = _jolpica_get(driver_path)
+        driver_items = _parse_driver_standings(raw_drivers) or []
+        _save_driver_standings_cache(season, driver_items)
+        print(f"JOB F1_STANDINGS: Guardados {len(driver_items)} pilotos en caché para season={season}.")
+
+        # --- Constructores ---
+        print("JOB F1_STANDINGS: Obteniendo clasificación de CONSTRUCTORES desde Jolpica...")
+        constructor_path = "current/constructorStandings.json"
+        raw_constructors = _jolpica_get(constructor_path)
+        constructor_items = _parse_constructor_standings(raw_constructors) or []
+        _save_constructor_standings_cache(season, constructor_items)
+        print(f"JOB F1_STANDINGS: Guardados {len(constructor_items)} constructores en caché para season={season}.")
+
+        print(f"--- JOB F1_STANDINGS: FIN OK ({datetime.now(timezone.utc).isoformat()}) ---")
+
+    except JolpicaError as e:
+        # Error “esperable” de proveedor externo
+        print("!!!!!!!! JOB F1_STANDINGS: ERROR Jolpica !!!!!!!!")
+        print(f"Detalle: {e}")
+
+    except Exception as e:
+        # Cualquier error inesperado
+        print("!!!!!!!! JOB F1_STANDINGS: ERROR inesperado !!!!!!!!")
+        print(f"Detalle: {e}")
 
 # --- check_deadlines_and_notify MODIFICADA (v2 - notifica una vez por usuario/carrera) ---
 def check_deadlines_and_notify():
@@ -520,73 +1035,114 @@ def _send_single_reminder_task(message):
 # --- MODIFICAR ESTA FUNCIÓN en mi_api.txt ---
 
 # --- NUEVA Función para Notificación de Estado de Apuesta ---
-# Similar a send_fcm_result_notification_task
-def send_fcm_bet_status_notification_task(user_id, fcm_token, race_name, porra_name, new_status, lang='es'):
+def send_fcm_bet_status_notification_task(user_id, fcm_token, race_name, porra_name, new_status, porra_id, ano, id_creador, tipo_porra, lang='es'):
     """
-    Tarea en background para enviar notificación FCM sobre aceptación/rechazo de apuesta (multiidioma).
+    Tarea en background para enviar notificación FCM sobre aceptación/rechazo de apuesta.
     """
     status_text = "ACEPTADA" if new_status == 'ACEPTADA' else "RECHAZADA"
-    print(f"BACKGROUND TASK (Bet Status): Iniciando envío FCM para user {user_id}, apuesta {status_text} en '{race_name}'...")
+    print(f"BACKGROUND TASK (Bet Status): Enviando a user {user_id} sobre apuesta {status_text}...")
 
     try:
-        # --- INICIO: Verificación/Inicialización Firebase (Copiar bloque estándar) ---
+        # --- INICIO: Inicialización Firebase (Igual que el resto) ---
         if firebase_admin._DEFAULT_APP_NAME not in firebase_admin._apps:
-            print(f"BACKGROUND TASK (Bet Status): Firebase no inicializado. Re-inicializando...")
             try:
                 if os.path.exists(FIREBASE_CRED_PATH):
                     cred_task = credentials.Certificate(FIREBASE_CRED_PATH)
-                    firebase_admin.initialize_app(
-                        cred_task,
-                        {'projectId': FIREBASE_PROJECT_ID},
-                        name=f'firebase-task-betstatus-{user_id}-{datetime.now().timestamp()}'
-                    )
-                    print("BACKGROUND TASK (Bet Status): Firebase inicializado DENTRO de la tarea.")
-                else:
-                    print(f"BACKGROUND TASK ERROR (Bet Status): No se encontró credenciales en '{FIREBASE_CRED_PATH}'. Abortando.")
-                    return
-            except ValueError:
-                print(f"BACKGROUND TASK INFO (Bet Status): Firebase ya inicializado por otro hilo.")
-                pass
-            except Exception as init_error:
-                print(f"BACKGROUND TASK ERROR (Bet Status): Fallo al inicializar Firebase: {init_error}")
-                return
-        # --- FIN: Verificación/Inicialización Firebase ---
+                    firebase_admin.initialize_app(cred_task, {'projectId': FIREBASE_PROJECT_ID})
+            except ValueError: pass
+            except Exception: return
+        # --- FIN ---
 
-        if not fcm_token:
-            print(f"BACKGROUND TASK (Bet Status): No hay token FCM para user {user_id}. Abortando.")
-            return
+        if not fcm_token: return
 
-        # --- Construir Mensaje Multiidioma ---
         lang = _pick_lang(lang)
-        title, body = _fcm_text('bet_status_update', lang,
-                                race=race_name, porra=porra_name,
-                                status=('ACEPTADA' if new_status == 'ACEPTADA' else 'RECHAZADA'))
+        title, body = _fcm_text('bet_status_update', lang, race=race_name, porra=porra_name, status=new_status)
+
+        # DATOS CLAVE PARA LA NAVEGACIÓN EN FLUTTER
+        data_payload = {
+            'tipo_notificacion': 'bet_status_update',
+            'race_name': str(race_name),
+            'porra_name': str(porra_name),
+            'new_status': str(new_status),
+            # Datos necesarios para abrir PorraDetailScreen directamente
+            'porra_id': str(porra_id),
+            'ano': str(ano),
+            'id_creador': str(id_creador),
+            'tipo_porra': str(tipo_porra)
+        }
 
         message = messaging.Message(
             notification=messaging.Notification(title=title, body=body),
-            data={
-                'tipo_notificacion': 'bet_status_update',
-                'race_name': race_name,
-                'porra_name': porra_name,
-                'new_status': new_status
-            },
+            data=data_payload,
             token=fcm_token
         )
-        print(f"BACKGROUND TASK (Bet Status): Mensaje construido para token ...{fcm_token[-10:]}")
+        messaging.send(message)
+        print(f"BACKGROUND TASK (Bet Status): Enviado con éxito.")
 
-        # --- Envío del Mensaje ---
-        response = messaging.send(message)
-        print(f"--- BACKGROUND TASK SUCCESS (Bet Status)! MsgID: {response} ---")
-
-    except firebase_admin.messaging.ApiCallError as fcm_api_error:
-        print(f"!!!!!!!! BACKGROUND TASK FCM API ERROR (Bet Status) !!!!!!!!")
-        print(f"ERROR: Código={fcm_api_error.code}, Mensaje='{fcm_api_error.message}'")
     except Exception as e:
-        print(f"!!!!!!!! BACKGROUND TASK GENERAL ERROR (Bet Status) !!!!!!!!")
-        import traceback; traceback.print_exc()
-    finally:
-        print(f"BACKGROUND TASK (Bet Status): Finalizado para user {user_id}, carrera '{race_name}'.")
+        print(f"ERROR BACKGROUND TASK (Bet Status): {e}")
 
+def send_fcm_new_bet_admin_notification_task(admin_id, fcm_token, race_name, porra_name, user_name, porra_id, ano, id_creador, tipo_porra, lang='es'):
+    """
+    NUEVA: Notifica al ADMIN de una porra que hay una nueva apuesta pendiente para revisar.
+    """
+    print(f"BACKGROUND TASK (New Bet Admin): Notificando admin {admin_id} de apuesta de {user_name}...")
+
+    try:
+        # --- Inicialización Firebase ---
+        if firebase_admin._DEFAULT_APP_NAME not in firebase_admin._apps:
+            try:
+                if os.path.exists(FIREBASE_CRED_PATH):
+                    cred_task = credentials.Certificate(FIREBASE_CRED_PATH)
+                    firebase_admin.initialize_app(cred_task, {'projectId': FIREBASE_PROJECT_ID})
+            except ValueError: pass
+            except Exception: return
+        
+        if not fcm_token: return
+
+        # Título y cuerpo "hardcoded" con soporte básico de idioma (puedes añadirlo a FCM_TEXTS si prefieres)
+        lang = _pick_lang(lang)
+        if lang == 'es':
+            title = "🔔 Nueva apuesta pendiente"
+            body = f"{user_name} ha enviado una apuesta para {race_name} en '{porra_name}'."
+        elif lang == 'en':
+            title = "🔔 New pending bet"
+            body = f"{user_name} sent a bet for {race_name} in '{porra_name}'."
+        elif lang == 'fr':
+            title = "🔔 Nouveau pari en attente"
+            body = f"{user_name} a envoyé un pari pour {race_name} dans '{porra_name}'."
+        elif lang == 'pt':
+            title = "🔔 Nova aposta pendente"
+            body = f"{user_name} enviou uma aposta para {race_name} em '{porra_name}'."
+        elif lang == 'ca':
+            title = "🔔 Nova aposta pendent"
+            body = f"{user_name} ha enviat una aposta per {race_name} a '{porra_name}'."
+        else: # Fallback básico (Español)
+            title = "🔔 Nueva apuesta pendiente"
+            body = f"{user_name} ha enviado una apuesta para {race_name} en '{porra_name}'."
+
+        data_payload = {
+            'tipo_notificacion': 'new_bet_admin', # Tipo nuevo para Flutter
+            'race_name': str(race_name),
+            'porra_name': str(porra_name),
+            'user_name': str(user_name),
+            # Datos para navegación
+            'porra_id': str(porra_id),
+            'ano': str(ano),
+            'id_creador': str(id_creador),
+            'tipo_porra': str(tipo_porra)
+        }
+
+        message = messaging.Message(
+            notification=messaging.Notification(title=title, body=body),
+            data=data_payload,
+            token=fcm_token
+        )
+        messaging.send(message)
+        print(f"BACKGROUND TASK (New Bet Admin): Enviado con éxito.")
+
+    except Exception as e:
+        print(f"ERROR BACKGROUND TASK (New Bet Admin): {e}")
 
 # --- NUEVA Función para Notificación de Invitación a Porra ---
 def send_fcm_invitation_notification_task(user_id_invitado, fcm_token_invitado, porra_id, porra_name, nombre_invitador, lang='es'):
@@ -1412,6 +1968,246 @@ def get_current_user_profile():
         if conn is not None:
             conn.close()
 
+# --- Endpoints para clasificaciones F1 (pilotos y constructores) (NUEVO) ---
+
+@app.route('/api/f1/standings/drivers', methods=['GET'])
+def obtener_clasificacion_pilotos_f1():
+    """
+    Devuelve la clasificación actual (o de una temporada concreta) de pilotos F1.
+    La información se obtiene de Jolpica/Ergast Y SE AUMENTA con datos locales (nombres, colores)
+    desde la tabla 'piloto_temporada'.
+    """
+    season_param = request.args.get('season', 'current').strip() or 'current'
+    force_refresh_param = (request.args.get('force_refresh', 'false') or '').strip().lower()
+    force_refresh = force_refresh_param in ('1', 'true', 't', 'yes', 'y', 'si', 'sí')
+
+    cache = _get_driver_standings_cache(season_param)
+    
+    # Si tenemos caché y no se pide refresco forzado y está fresca, devolvemos directamente
+    if cache and not force_refresh and _is_cache_fresh(cache.get("last_updated")):
+        last_updated = cache.get("last_updated")
+        if isinstance(last_updated, datetime):
+            last_updated_str = last_updated.astimezone(timezone.utc).isoformat()
+        else:
+            last_updated_str = str(last_updated) if last_updated is not None else None
+
+        return jsonify({
+            "season": cache.get("season"),
+            "last_updated": last_updated_str,
+            "stale": False,
+            "items": cache.get("items", []), # Devuelve items ya aumentados/cacheados
+        }), 200
+
+    # Si no hay caché o está vieja o se ha pedido force_refresh, intentamos ir a Jolpica
+    conn_db = None
+    try:
+        # 1. Obtener datos base de Jolpica
+        path = "current/driverStandings.json" if season_param == "current" else f"{season_param}/driverStandings.json"
+        raw_json = _jolpica_get(path)
+        items = _parse_driver_standings(raw_json) # Lista de dicts de Jolpica
+        
+        # 2. Obtener la temporada real (ej: "2025" en lugar de "current")
+        season_year_from_ergast = raw_json.get("MRData", {}).get("StandingsTable", {}).get("season")
+        if not season_year_from_ergast:
+             # Si no podemos determinar el año, devolvemos los items tal cual
+             print(f"WARN [drivers_standings]: No se pudo determinar el 'season' desde Ergast. Devolviendo datos sin aumentar.")
+             return jsonify({"season": season_param, "last_updated": datetime.now(timezone.utc).isoformat(), "stale": True, "items": items}), 200
+
+        # 3. Conectar a la BD local para obtener datos locales (colores, nombres)
+        conn_db = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
+        cur_db = conn_db.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        
+        sql_local_data = """
+            SELECT codigo_piloto, nombre_completo, escuderia, color_fondo_hex
+            FROM piloto_temporada
+            WHERE ano = %s;
+        """
+        cur_db.execute(sql_local_data, (season_year_from_ergast,))
+        local_pilotos_db = cur_db.fetchall()
+        cur_db.close()
+        
+        # Crear un mapa para búsqueda rápida
+        local_data_map = {p['codigo_piloto']: p for p in local_pilotos_db}
+
+        # 4. Aumentar los 'items' de Jolpica con los datos locales
+        augmented_items = []
+        for item in items:
+            driver_code = item.get('driverCode')
+            local_info = local_data_map.get(driver_code)
+            
+            if local_info:
+                # Sobrescribir nombre y escudería con los de la BD local
+                item['driverName'] = local_info.get('nombre_completo') or item['driverName']
+                item['constructorName'] = local_info.get('escuderia') or item['constructorName']
+                # Añadir el color
+                item['color_fondo_hex'] = local_info.get('color_fondo_hex') or '#CCCCCC'
+            else:
+                # Si no está en la BD local, asignar color por defecto
+                item['color_fondo_hex'] = '#CCCCCC'
+                print(f"WARN [drivers_standings]: Piloto {driver_code} de Jolpica no encontrado en piloto_temporada para año {season_year_from_ergast}.")
+
+            augmented_items.append(item)
+
+        # 5. Guardar en caché (BD)
+        _save_driver_standings_cache(season_param, augmented_items) # Guardar items aumentados
+        now_str = datetime.now(timezone.utc).isoformat()
+        
+        return jsonify({
+            "season": season_param,
+            "last_updated": now_str,
+            "stale": False,
+            "items": augmented_items, # Devolver items aumentados
+        }), 200
+
+    except JolpicaError as e:
+        print(f"ERROR en obtener_clasificacion_pilotos_f1 (Jolpica): {e}")
+        # Si Jolpica falla pero tenemos caché, devolvemos caché marcada como obsoleta
+        if cache:
+            last_updated = cache.get("last_updated")
+            if isinstance(last_updated, datetime):
+                last_updated_str = last_updated.astimezone(timezone.utc).isoformat()
+            else:
+                last_updated_str = str(last_updated) if last_updated is not None else None
+
+            return jsonify({
+                "season": cache.get("season"),
+                "last_updated": last_updated_str,
+                "stale": True,
+                "items": cache.get("items", []), # Devolver caché (ya debería estar aumentada)
+            }), 200
+
+        return jsonify({
+            "error": "jolpica_unavailable",
+            "message": "No se pudo obtener la clasificación de pilotos desde el proveedor externo."
+        }), 503
+
+    except (Exception, psycopg2.DatabaseError) as e:
+        print(f"ERROR inesperado en obtener_clasificacion_pilotos_f1 (DB local o general): {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": "internal_error"}), 500
+    finally:
+        if conn_db is not None:
+            conn_db.close()
+
+
+@app.route('/api/f1/standings/constructors', methods=['GET'])
+def obtener_clasificacion_constructores_f1():
+    """
+    Devuelve la clasificación actual (o de una temporada concreta) de constructores F1.
+    La información se obtiene de Jolpica/Ergast Y SE AUMENTA con datos locales (nombres, colores)
+    desde la tabla 'constructor_temporada'.
+    """
+    season_param = request.args.get('season', 'current').strip() or 'current'
+    force_refresh_param = (request.args.get('force_refresh', 'false') or '').strip().lower()
+    force_refresh = force_refresh_param in ('1', 'true', 't', 'yes', 'y', 'si', 'sí')
+
+    cache = _get_constructor_standings_cache(season_param)
+    
+    # Si tenemos caché y no se pide refresco forzado y está fresca, devolvemos directamente
+    if cache and not force_refresh and _is_cache_fresh(cache.get("last_updated")):
+        last_updated = cache.get("last_updated")
+        if isinstance(last_updated, datetime):
+            last_updated_str = last_updated.astimezone(timezone.utc).isoformat()
+        else:
+            last_updated_str = str(last_updated) if last_updated is not None else None
+
+        return jsonify({
+            "season": cache.get("season"),
+            "last_updated": last_updated_str,
+            "stale": False,
+            "items": cache.get("items", []), # Devuelve items ya aumentados/cacheados
+        }), 200
+
+    # Si no hay caché o está vieja o se ha pedido force_refresh, intentamos ir a Jolpica
+    conn_db = None
+    try:
+        # 1. Obtener datos base de Jolpica
+        path = "current/constructorStandings.json" if season_param == "current" else f"{season_param}/constructorStandings.json"
+        raw_json = _jolpica_get(path)
+        items = _parse_constructor_standings(raw_json) # Lista de dicts de Jolpica
+        
+        # 2. Obtener la temporada real (ej: "2025" en lugar de "current")
+        season_year_from_ergast = raw_json.get("MRData", {}).get("StandingsTable", {}).get("season")
+        if not season_year_from_ergast:
+             print(f"WARN [constructors_standings]: No se pudo determinar el 'season' desde Ergast. Devolviendo datos sin aumentar.")
+             return jsonify({"season": season_param, "last_updated": datetime.now(timezone.utc).isoformat(), "stale": True, "items": items}), 200
+
+        # 3. Conectar a la BD local para obtener datos locales (colores, nombres)
+        conn_db = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
+        cur_db = conn_db.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        
+        sql_local_data = """
+            SELECT constructor_ref, nombre_constructor, color_fondo_hex
+            FROM constructor_temporada
+            WHERE ano = %s;
+        """
+        cur_db.execute(sql_local_data, (season_year_from_ergast,))
+        local_constructors_db = cur_db.fetchall()
+        cur_db.close()
+        
+        # Crear un mapa para búsqueda rápida usando 'constructor_ref'
+        local_data_map = {c['constructor_ref']: c for c in local_constructors_db}
+        
+        # 4. Aumentar los 'items' de Jolpica con los datos locales
+        augmented_items = []
+        for item in items:
+            constructor_ref_id = item.get('constructorId') # 'constructorId' de Jolpica (ej: "red_bull")
+            local_info = local_data_map.get(constructor_ref_id)
+            
+            if local_info:
+                # Sobrescribir nombre con el de la BD local
+                item['constructorName'] = local_info.get('nombre_constructor') or item['constructorName']
+                # Añadir el color
+                item['color_fondo_hex'] = local_info.get('color_fondo_hex') or '#CCCCCC'
+            else:
+                # Si no está en la BD local, asignar color por defecto
+                item['color_fondo_hex'] = '#CCCCCC'
+                print(f"WARN [constructors_standings]: Constructor {constructor_ref_id} de Jolpica no encontrado en constructor_temporada para año {season_year_from_ergast}.")
+
+            augmented_items.append(item)
+
+        # 5. Guardar en caché (BD)
+        _save_constructor_standings_cache(season_param, augmented_items) # Guardar items aumentados
+        now_str = datetime.now(timezone.utc).isoformat()
+        
+        return jsonify({
+            "season": season_param,
+            "last_updated": now_str,
+            "stale": False,
+            "items": augmented_items, # Devolver items aumentados
+        }), 200
+
+    except JolpicaError as e:
+        print(f"ERROR en obtener_clasificacion_constructores_f1 (Jolpica): {e}")
+        # Si Jolpica falla pero tenemos caché, devolvemos caché marcada como obsoleta
+        if cache:
+            last_updated = cache.get("last_updated")
+            if isinstance(last_updated, datetime):
+                last_updated_str = last_updated.astimezone(timezone.utc).isoformat()
+            else:
+                last_updated_str = str(last_updated) if last_updated is not None else None
+
+            return jsonify({
+                "season": cache.get("season"),
+                "last_updated": last_updated_str,
+                "stale": True,
+                "items": cache.get("items", []), # Devolver caché (ya debería estar aumentada)
+            }), 200
+
+        return jsonify({
+            "error": "jolpica_unavailable",
+            "message": "No se pudo obtener la clasificación de constructores desde el proveedor externo."
+        }), 503
+
+    except (Exception, psycopg2.DatabaseError) as e:
+        print(f"ERROR inesperado en obtener_clasificacion_constructores_f1 (DB local o general): {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": "internal_error"}), 500
+    finally:
+        if conn_db is not None:
+            conn_db.close()
 
 # --- Endpoint GET /api/carreras (MODIFICADO para incluir resultado_detallado) ---
 @app.route('/api/carreras', methods=['GET'])
@@ -1671,7 +2467,7 @@ L’equip de F1 Porra App
 def registrar_o_actualizar_apuesta(id_porra):
     id_usuario_actual = get_jwt_identity() # ID String
 
-    # --- Validaciones básicas input (sin cambios) ---
+    # --- Validaciones básicas input ---
     if not request.is_json: return jsonify({"error": "La solicitud debe ser JSON"}), 400
     data = request.get_json()
     id_carrera = data.get('id_carrera')
@@ -1687,27 +2483,43 @@ def registrar_o_actualizar_apuesta(id_porra):
         conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-        # --- User ID Conversion (sin cambios) ---
+        # --- User ID Conversion ---
         try: id_usuario_actual_int = int(id_usuario_actual)
         except (ValueError, TypeError): return jsonify({"error": "Error interno autorización."}), 500
 
-        # --- Validaciones Previas ---
-        # Porra existe y OBTENER TIPO PORRA? (sin cambios)
-        cur.execute("SELECT ano, tipo_porra FROM porra WHERE id_porra = %s;", (id_porra,))
+        # --- 1. Info Porra + Datos Admin (NUEVO: Join con usuario para token admin) ---
+        sql_porra = """
+            SELECT p.ano, p.tipo_porra, p.nombre_porra, p.id_creador,
+                   u.fcm_token as admin_token, u.language_code as admin_lang
+            FROM porra p
+            JOIN usuario u ON p.id_creador = u.id_usuario
+            WHERE p.id_porra = %s;
+        """
+        cur.execute(sql_porra, (id_porra,))
         porra_info = cur.fetchone()
         if porra_info is None: return jsonify({"error": "Porra no encontrada"}), 404
+        
         tipo_porra_actual = porra_info['tipo_porra']
+        nombre_porra = porra_info['nombre_porra']
+        ano_porra = porra_info['ano']
+        id_creador = porra_info['id_creador']
+        admin_token = porra_info['admin_token']
+        admin_lang = porra_info['admin_lang']
 
-        # Carrera existe y obtener año y fecha límite? (sin cambios)
-        cur.execute("SELECT ano, fecha_limite_apuesta FROM carrera WHERE id_carrera = %s;", (id_carrera,))
+        # --- 2. Info Usuario Actual (NUEVO: Nombre para la notificación) ---
+        cur.execute("SELECT nombre FROM usuario WHERE id_usuario = %s;", (id_usuario_actual_int,))
+        user_row = cur.fetchone()
+        nombre_usuario_actual = user_row['nombre'] if user_row else "Usuario"
+
+        # --- 3. Info Carrera ---
+        cur.execute("SELECT ano, fecha_limite_apuesta, desc_carrera FROM carrera WHERE id_carrera = %s;", (id_carrera,))
         carrera_info = cur.fetchone()
         if carrera_info is None: return jsonify({"error": "Carrera no encontrada"}), 404
         ano_carrera = carrera_info['ano']
         fecha_limite_db = carrera_info['fecha_limite_apuesta']
+        nombre_carrera = carrera_info['desc_carrera']
 
-        # Validación Pilotos Activos por Carrera (sin cambios)
-        # ... (código idéntico para obtener active_drivers_for_race y expected_driver_count_for_race) ...
-        # ... (validaciones de longitud y códigos de pilotos_input y vrapida contra active_drivers_for_race) ...
+        # --- Validación Pilotos (Igual que antes) ---
         active_drivers_for_race = set()
         expected_driver_count_for_race = 0
         sql_race_drivers = "SELECT codigo_piloto FROM piloto_carrera_detalle WHERE id_carrera = %s AND activo_para_apuesta = TRUE;"
@@ -1720,102 +2532,80 @@ def registrar_o_actualizar_apuesta(id_porra):
             pilotos_temporada_db = cur.fetchall()
             if not pilotos_temporada_db: return jsonify({"error": f"No hay pilotos definidos para carrera {id_carrera} o temporada {ano_carrera}."}), 409
             active_drivers_for_race = {p['codigo_piloto'] for p in pilotos_temporada_db}; expected_driver_count_for_race = len(active_drivers_for_race)
+        
         if len(posiciones_input) != expected_driver_count_for_race: return jsonify({"error": f"Número incorrecto de posiciones. Se esperaban {expected_driver_count_for_race}."}), 400
         if not all(p_code in active_drivers_for_race for p_code in posiciones_input): invalid_codes = [p for p in posiciones_input if p not in active_drivers_for_race]; return jsonify({"error": f"Códigos de piloto inválidos/inactivos en posiciones: {invalid_codes}"}), 400
         if vrapida not in active_drivers_for_race: return jsonify({"error": f"Piloto de vuelta rápida '{vrapida}' inválido/inactivo."}), 400
 
-        # Membresía (sin cambios)
+        # --- Membresía ---
         sql_check_membership = "SELECT 1 FROM participacion WHERE id_porra = %s AND id_usuario = %s AND estado IN ('CREADOR', 'ACEPTADA');"
         cur.execute(sql_check_membership, (id_porra, id_usuario_actual_int))
         if cur.fetchone() is None: return jsonify({"error": "No eres miembro activo."}), 403
 
-        # Fecha Límite (sin cambios)
+        # --- Fecha Límite ---
         if fecha_limite_db is None: return jsonify({"error": "Fecha límite no definida."}), 409
         try: from zoneinfo import ZoneInfo
         except ImportError: from pytz import timezone as ZoneInfo
         try: tz_madrid = ZoneInfo("Europe/Madrid")
         except Exception: tz_madrid = timezone.utc
         now_local = datetime.now(tz_madrid)
-        # Asegurar que ambas fechas tienen timezone para comparar
         if fecha_limite_db.tzinfo is None: fecha_limite_db = fecha_limite_db.replace(tzinfo=timezone.utc)
         if now_local.tzinfo is None: now_local = now_local.replace(tzinfo=timezone.utc)
         if now_local.astimezone(timezone.utc) > fecha_limite_db.astimezone(timezone.utc): return jsonify({"error": "Fecha límite pasada."}), 409
 
-        # --- >>> NUEVA Lógica de Estado Apuesta <<< ---
-        estado_final_apuesta = 'PENDIENTE' # Valor por defecto para administrada
-        fecha_estado_final = None # Fecha aceptación/rechazo (se pone al responder)
-        now_utc_db = datetime.now(timezone.utc) # Momento actual para fecha_modificacion
+        # --- Lógica de Estado Apuesta ---
+        estado_final_apuesta = 'PENDIENTE'
+        fecha_estado_final = None
+        now_utc_db = datetime.now(timezone.utc)
 
-        # 1. Comprobar si existe apuesta previa para este usuario/carrera/porra
         cur.execute("SELECT estado_apuesta FROM apuesta WHERE id_porra = %s AND id_carrera = %s AND id_usuario = %s;",
                     (id_porra, id_carrera, id_usuario_actual_int))
         apuesta_previa = cur.fetchone()
 
-        # 2. Determinar estado final
         if tipo_porra_actual in ['PUBLICA', 'PRIVADA_AMISTOSA']:
             estado_final_apuesta = 'ACEPTADA'
-            fecha_estado_final = now_utc_db # Se acepta automáticamente
+            fecha_estado_final = now_utc_db
         elif tipo_porra_actual == 'PRIVADA_ADMINISTRADA':
-            if apuesta_previa:
-                # Si había apuesta previa en porra administrada...
-                estado_previo = apuesta_previa['estado_apuesta']
-                if estado_previo == 'ACEPTADA':
-                    # Si estaba ACEPTADA, la modificación la MANTIENE ACEPTADA
-                    estado_final_apuesta = 'ACEPTADA'
-                    fecha_estado_final = now_utc_db # Actualizamos fecha de estado (o podríamos mantener la original?)
-                                                  # -> Actualizarla parece más lógico para indicar que se tocó
-                elif estado_previo == 'RECHAZADA':
-                    # Si estaba RECHAZADA, la modificación la vuelve a poner PENDIENTE
-                    estado_final_apuesta = 'PENDIENTE'
-                    fecha_estado_final = None # El creador debe volver a decidir
-                else: # PENDIENTE (o estado inesperado)
-                    # Si estaba PENDIENTE, sigue PENDIENTE
-                    estado_final_apuesta = 'PENDIENTE'
-                    fecha_estado_final = None
+            if apuesta_previa and apuesta_previa['estado_apuesta'] == 'ACEPTADA':
+                estado_final_apuesta = 'ACEPTADA'
+                fecha_estado_final = now_utc_db
             else:
-                # Si no había apuesta previa (es la primera vez), queda PENDIENTE
                 estado_final_apuesta = 'PENDIENTE'
                 fecha_estado_final = None
-        # --- >>> FIN NUEVA Lógica de Estado Apuesta <<< ---
 
-
-        # Lógica Trofeo Primera Apuesta (sin cambios)
+        # Lógica Trofeo Primera Apuesta
         should_award_first_bet_trophy = False
         cur.execute("SELECT COUNT(*) FROM apuesta WHERE id_usuario = %s;", (id_usuario_actual_int,))
-        if cur.fetchone()[0] == 0 and not apuesta_previa : # Solo si realmente no tenía NINGUNA apuesta antes
+        if cur.fetchone()[0] == 0 and not apuesta_previa :
             should_award_first_bet_trophy = True
 
-
-        # --- Modificaciones BD (Upsert con manejo de estado) ---
+        # --- Upsert Apuesta ---
         sql_upsert = """
             INSERT INTO apuesta (id_porra, id_carrera, id_usuario, posiciones, vrapida, estado_apuesta, fecha_estado_apuesta, fecha_modificacion)
             VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s)
             ON CONFLICT (id_porra, id_carrera, id_usuario) DO UPDATE SET
-                posiciones = EXCLUDED.posiciones,
-                vrapida = EXCLUDED.vrapida,
-                estado_apuesta = EXCLUDED.estado_apuesta,
-                fecha_estado_apuesta = EXCLUDED.fecha_estado_apuesta,
+                posiciones = EXCLUDED.posiciones, vrapida = EXCLUDED.vrapida,
+                estado_apuesta = EXCLUDED.estado_apuesta, fecha_estado_apuesta = EXCLUDED.fecha_estado_apuesta,
                 fecha_modificacion = EXCLUDED.fecha_modificacion;
-            """
+        """
         posiciones_json = json.dumps(posiciones_input)
-        valores = (
-            id_porra, id_carrera, id_usuario_actual_int,
-            posiciones_json, vrapida,
-            estado_final_apuesta,       # Estado calculado
-            fecha_estado_final,         # Fecha estado calculada
-            now_utc_db                  # Fecha modificación SIEMPRE se actualiza
-        )
+        valores = (id_porra, id_carrera, id_usuario_actual_int, posiciones_json, vrapida, estado_final_apuesta, fecha_estado_final, now_utc_db)
         cur.execute(sql_upsert, valores)
 
-        # Otorgar Trofeo (sin cambios)
         if should_award_first_bet_trophy:
-            # Usamos el estado final para decidir si el trofeo se otorga YA
-            # En porras administradas, solo se otorga si la apuesta inicial ya fue aceptada
-            # -> Mejor lo asociamos al evento de ACEPTACIÓN si es administrada.
-            # -> Por ahora, mantenemos la lógica original: se otorga al primer registro exitoso
-            #    independientemente del estado final, para simplificar.
              if not _award_trophy(id_usuario_actual_int, 'PRIMERA_APUESTA', conn, cur):
                 print(f"WARN: _award_trophy (PRIMERA_APUESTA) retornó False.")
+
+        # --- NOTIFICACIÓN AL ADMIN (NUEVO) ---
+        # Solo si es administrada, queda pendiente y quien apuesta NO es el propio admin
+        if tipo_porra_actual == 'PRIVADA_ADMINISTRADA' and estado_final_apuesta == 'PENDIENTE' and id_usuario_actual_int != id_creador:
+            if admin_token and thread_pool_executor:
+                thread_pool_executor.submit(
+                    send_fcm_new_bet_admin_notification_task,
+                    id_creador, admin_token, nombre_carrera, nombre_porra, nombre_usuario_actual,
+                    id_porra, ano_porra, id_creador, tipo_porra_actual, # Datos para que Flutter navegue
+                    admin_lang
+                )
 
         conn.commit()
         mensaje_respuesta = "Apuesta registrada/actualizada correctamente."
@@ -1824,16 +2614,16 @@ def registrar_o_actualizar_apuesta(id_porra):
 
         return jsonify({"mensaje": mensaje_respuesta}), 201
 
-    except psycopg2.Error as db_error: # Manejo de errores sin cambios
+    except psycopg2.Error as db_error:
         print(f"ERROR DB [Registrar Apuesta]: {db_error}")
         if conn: conn.rollback()
         return jsonify({"error": "Error de base de datos al registrar apuesta"}), 500
-    except Exception as error: # Manejo de errores sin cambios
+    except Exception as error:
         print(f"ERROR General [Registrar Apuesta]: {error}")
         import traceback; traceback.print_exc()
         if conn: conn.rollback()
         return jsonify({"error": "Error interno al registrar apuesta"}), 500
-    finally: # Sin cambios
+    finally:
         if cur is not None and not cur.closed: cur.close()
         if conn is not None and not conn.closed: conn.close()
 # --- FIN Endpoint POST Apuestas MODIFICADO ---
@@ -1943,6 +2733,20 @@ def crear_porra():
              print(f"ERROR: ID de creador inválido en token: {id_creador}")
              cur.close(); conn.close()
              return jsonify({"error": "Error interno de autorización"}), 500
+
+        # --- INICIO NUEVA MEDIDA DE SEGURIDAD ---
+        # Contar cuántas porras tiene este usuario como CREADOR
+        sql_count = "SELECT COUNT(*) FROM porra WHERE id_creador = %s;"
+        cur.execute(sql_count, (id_creador_int,))
+        count_result = cur.fetchone()
+        num_porras_creadas = count_result[0] if count_result else 0
+
+        if num_porras_creadas >= 5:
+            # Si ya tiene 5 o más, rechazamos la creación
+            cur.close(); conn.close()
+            # Devolvemos un código de error específico "LIMIT_REACHED" para que el Flutter lo detecte
+            return jsonify({"error": "LIMIT_REACHED"}), 409 # 409 Conflict
+        # --- FIN NUEVA MEDIDA DE SEGURIDAD ---
 
         # 1. Insertar la nueva porra (incluyendo tipo_porra)
         # Asegúrate que tu tabla 'porra' tiene la columna 'tipo_porra'
@@ -4569,8 +5373,7 @@ def obtener_porras_publicas():
             conn.close()
 
 
-
-# --- NUEVO Endpoint POST /api/porras/publica/<id_porra>/join ---
+# --- Endpoint POST /api/porras/publica/<id_porra>/join (CORREGIDO) ---
 # Permite a un usuario autenticado unirse a una porra pública específica
 @app.route('/api/porras/publica/<int:id_porra>/join', methods=['POST'])
 @jwt_required() # Requiere que el usuario esté logueado
@@ -4586,19 +5389,21 @@ def unirse_porra_publica(id_porra):
         conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-        # 1. Verificar si la porra existe y es pública
-        cur.execute("SELECT es_publica, id_creador FROM porra WHERE id_porra = %s;", (id_porra,))
+        # 1. Verificar si la porra existe y es pública (CORREGIDO: Usar tipo_porra)
+        cur.execute("SELECT tipo_porra, id_creador FROM porra WHERE id_porra = %s;", (id_porra,))
         porra_info = cur.fetchone()
 
         if not porra_info:
             return jsonify({"error": "Porra no encontrada"}), 404
-        if not porra_info['es_publica']:
+        
+        # --- CORRECCIÓN: Verificar tipo_porra en lugar de es_publica ---
+        if porra_info['tipo_porra'] != 'PUBLICA':
             return jsonify({"error": "Esta porra no es pública"}), 403 # Forbidden
+        # ---------------------------------------------------------------
 
-        # 2. (Opcional) Impedir que el creador se una a sí mismo (ya debería estar por la creación)
+        # 2. (Opcional) Impedir que el creador se una a sí mismo
         if porra_info['id_creador'] == id_usuario_actual:
-            # Podrías simplemente devolver éxito o un mensaje indicando que ya es creador
-            return jsonify({"mensaje": "Ya eres el creador de esta porra"}), 200 # O 409 Conflict si prefieres
+            return jsonify({"mensaje": "Ya eres el creador de esta porra"}), 200 
 
         # 3. Verificar si el usuario ya es miembro
         cur.execute("SELECT 1 FROM participacion WHERE id_porra = %s AND id_usuario = %s;", (id_porra, id_usuario_actual))
@@ -4611,19 +5416,18 @@ def unirse_porra_publica(id_porra):
         sql_insert = """
             INSERT INTO participacion (id_porra, id_usuario, estado)
             VALUES (%s, %s, 'ACEPTADA')
-            ON CONFLICT (id_porra, id_usuario) DO NOTHING; -- Seguridad extra por si acaso
+            ON CONFLICT (id_porra, id_usuario) DO NOTHING;
         """
         cur.execute(sql_insert, (id_porra, id_usuario_actual))
 
         conn.commit()
         cur.close()
 
-        return jsonify({"mensaje": "Te has unido a la porra pública correctamente"}), 200 # OK (o 201 si prefieres)
+        return jsonify({"mensaje": "Te has unido a la porra pública correctamente"}), 200 
 
-    except psycopg2.Error as db_error: # Captura errores específicos de psycopg2
+    except psycopg2.Error as db_error: 
         print(f"Error de base de datos en unirse_porra_publica: {db_error}")
         if conn: conn.rollback()
-        # Evita exponer detalles del error de BD
         return jsonify({"error": "Error de base de datos al intentar unirse a la porra"}), 500
     except Exception as error:
         print(f"Error inesperado en unirse_porra_publica: {error}")
@@ -4634,7 +5438,6 @@ def unirse_porra_publica(id_porra):
     finally:
         if conn is not None:
             conn.close()
-
 
 # --- Endpoint GET /api/porras/<id_porra>/my-bets (MODIFICADO v2 con estado_apuesta) ---
 @app.route('/api/porras/<int:id_porra>/my-bets', methods=['GET'])
@@ -5083,6 +5886,55 @@ def listar_apuestas_pendientes(id_porra, id_carrera):
             conn.close()
 # --- FIN NUEVO Endpoint GET ---
 
+# --- INICIO: NUEVO ENDPOINT PARA TEMPORADAS DE CLASIFICACIÓN ---
+# Este endpoint obtiene la lista de temporadas disponibles para el filtro
+# desde la nueva tabla f1_available_seasons que creaste.
+@app.route('/api/f1/standings/seasons', methods=['GET'])
+def obtener_temporadas_disponibles_f1():
+    """
+    Devuelve la lista de temporadas disponibles para los filtros de clasificación,
+    leyendo desde la tabla 'f1_available_seasons'.
+    """
+    conn = None
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            database=DB_NAME,
+            user=DB_USER,
+            password=DB_PASS
+        )
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        
+        # Consulta a la nueva tabla, ordenada por 'sort_order'
+        sql_query = """
+            SELECT season_value, season_label_key
+            FROM f1_available_seasons
+            ORDER BY sort_order ASC;
+        """
+        cur.execute(sql_query)
+        
+        seasons_db = cur.fetchall()
+        cur.close()
+
+        # Formatear la salida como una lista de diccionarios
+        lista_seasons = []
+        for row in seasons_db:
+            lista_seasons.append({
+                "value": row["season_value"],
+                "labelKey": row["season_label_key"]
+            })
+
+        return jsonify(lista_seasons), 200
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"Error en obtener_temporadas_disponibles_f1: {error}")
+        return jsonify({"error": "No se pudieron obtener las temporadas disponibles"}), 500
+    finally:
+        if conn is not None:
+            conn.close()
+# --- FIN: NUEVO ENDPOINT ---
+
 # --- Endpoint POST para aceptar/rechazar apuesta (MODIFICADO para Notificación) ---
 @app.route('/api/apuestas/<int:id_apuesta>/respuesta', methods=['POST'])
 @jwt_required()
@@ -5095,16 +5947,16 @@ def responder_apuesta_pendiente(id_apuesta):
     if aceptar is None or not isinstance(aceptar, bool): return jsonify({"error": "Falta 'aceptar' (true/false) o inválido"}), 400
 
     conn = None
-    cur = None # Asegurar que cur se pueda cerrar en finally
+    cur = None 
     try:
         conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-        # 1. Obtener detalles apuesta, porra, usuario APOSTADOR y carrera
+        # 1. Obtener detalles (MODIFICADO: añadimos p.ano)
         sql_get_info = """
             SELECT
                 a.id_usuario, a.id_carrera, a.estado_apuesta,
-                p.id_porra, p.nombre_porra, p.id_creador, p.tipo_porra,
+                p.id_porra, p.nombre_porra, p.id_creador, p.tipo_porra, p.ano, -- <--- AÑADIDO p.ano
                 c.desc_carrera,
                 u.fcm_token,
                 u.language_code
@@ -5119,7 +5971,7 @@ def responder_apuesta_pendiente(id_apuesta):
 
         if not info: return jsonify({"error": "Apuesta no encontrada"}), 404
 
-        # 2. Validaciones (Porra admin, Creador, Estado pendiente)
+        # 2. Validaciones
         if info['tipo_porra'] != 'PRIVADA_ADMINISTRADA': return jsonify({"error": "Apuesta no pertenece a porra administrada"}), 403
         try:
             id_creador_db = info['id_creador']
@@ -5128,20 +5980,17 @@ def responder_apuesta_pendiente(id_apuesta):
         except (ValueError, TypeError): return jsonify({"error": "Error interno autorización"}), 500
         if info['estado_apuesta'] != 'PENDIENTE': return jsonify({"error": "Apuesta ya no está pendiente"}), 409
 
-        # 3. Actualizar estado de la apuesta
+        # 3. Actualizar estado
         nuevo_estado = 'ACEPTADA' if aceptar else 'RECHAZADA'
         fecha_decision = datetime.now(timezone.utc)
         sql_update_bet = "UPDATE apuesta SET estado_apuesta = %s, fecha_estado_apuesta = %s WHERE id_apuesta = %s;"
         cur.execute(sql_update_bet, (nuevo_estado, fecha_decision, id_apuesta))
 
-        # --- 4. Enviar Notificación (si hay token) ---
+        # 4. Enviar Notificación (MODIFICADO: Pasamos datos extra para navegación)
         fcm_token_apostador = info.get('fcm_token')
         id_usuario_apostador = info.get('id_usuario')
-        nombre_carrera = info.get('desc_carrera', 'esta carrera')
-        nombre_porra = info.get('nombre_porra', 'esta porra')
-
+        
         if fcm_token_apostador and id_usuario_apostador:
-            print(f"DEBUG [Responder Apuesta]: Intentando enviar notif '{nuevo_estado}' a user {id_usuario_apostador}...")
             user_lang = (info.get('language_code') or 'es').strip().lower()
             global thread_pool_executor
             if thread_pool_executor:
@@ -5149,34 +5998,30 @@ def responder_apuesta_pendiente(id_apuesta):
                      send_fcm_bet_status_notification_task,
                      id_usuario_apostador,
                      fcm_token_apostador,
-                     nombre_carrera,
-                     nombre_porra,
-                     nuevo_estado, # 'ACEPTADA' o 'RECHAZADA'
-                     user_lang   
+                     info['desc_carrera'], # race_name
+                     info['nombre_porra'], # porra_name
+                     nuevo_estado,
+                     info['id_porra'],     # <--- NUEVO
+                     info['ano'],          # <--- NUEVO
+                     info['id_creador'],   # <--- NUEVO
+                     info['tipo_porra'],   # <--- NUEVO
+                     user_lang
                  )
-                 print(f"DEBUG [Responder Apuesta]: Tarea FCM ({nuevo_estado}) enviada al executor.")
-            else:
-                 print("WARN [Responder Apuesta]: ThreadPoolExecutor no disponible, no se pudo enviar tarea FCM.")
-        else:
-             print(f"DEBUG [Responder Apuesta]: No se envía notificación (token o ID apostador faltante). Token: {'Sí' if fcm_token_apostador else 'No'}, ID: {id_usuario_apostador}")
-        # --- Fin Enviar Notificación ---
 
         conn.commit()
-        cur.close()
-
         mensaje = f"Apuesta {'aceptada' if aceptar else 'rechazada'} correctamente."
         return jsonify({"mensaje": mensaje}), 200
 
-    except psycopg2.Error as db_error: # Sin cambios manejo error
+    except psycopg2.Error as db_error:
         print(f"Error DB en responder_apuesta_pendiente: {db_error}")
         if conn: conn.rollback()
         return jsonify({"error": "Error de base de datos"}), 500
-    except Exception as error: # Sin cambios manejo error
+    except Exception as error:
         print(f"Error inesperado en responder_apuesta_pendiente: {error}")
         import traceback; traceback.print_exc()
         if conn: conn.rollback()
         return jsonify({"error": "Error interno al responder a la apuesta"}), 500
-    finally: # Sin cambios
+    finally:
         if cur is not None and not cur.closed: cur.close()
         if conn is not None and not conn.closed: conn.close()
 # --- FIN Endpoint POST Respuesta Apuesta MODIFICADO ---
@@ -5220,6 +6065,106 @@ def update_language():
         if conn is not None:
             conn.close()
 
+# Token de seguridad (defínelo en tus variables de entorno o pon uno difícil aquí)
+GPT_ACTION_SECRET = os.environ.get('GPT_ACTION_SECRET', 'F1_PORRA_SECRET_KEY_2025')
+
+@app.route('/api/external/publish-news', methods=['POST'])
+def publicar_noticia_gpt():
+    # 1. Seguridad
+    auth_header = request.headers.get('Authorization')
+    SECRET = os.environ.get('GPT_ACTION_SECRET', 'F1_PORRA_SECRET_KEY_2025') 
+    if not auth_header or auth_header != f"Bearer {SECRET}":
+        return jsonify({"error": "No autorizado"}), 401
+
+    data = request.get_json()
+    final_image_url = None
+    
+    print("Recibida noticia del GPT...")
+
+    # 2. GENERACIÓN DE IMAGEN (La Solución Definitiva)
+    # Si el GPT nos manda una descripción visual ('image_prompt'), usamos una IA externa gratuita.
+    if 'image_prompt' in data and data['image_prompt']:
+        prompt = data['image_prompt']
+        print(f"Generando imagen externa con prompt: {prompt}")
+        
+        # Codificamos el prompt para la URL
+        encoded_prompt = urllib.parse.quote(prompt)
+        # Usamos Pollinations.ai (Modelo Flux, alta calidad, gratis, sin API Key)
+        # Forzamos 16:9 (1280x720)
+        pollinations_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1280&height=720&model=flux&nologo=true"
+        
+        # Reutilizamos tu función de descarga que ya tienes (upload_image_to_firebase)
+        # Pollinations NO bloquea servidores, así que funcionará perfecto.
+        final_image_url = upload_image_to_firebase(pollinations_url)
+
+    # Fallback: Si no hay prompt pero hay URL (método antiguo), probamos
+    if not final_image_url and 'imagen_url' in data:
+        final_image_url = upload_image_to_firebase(data['imagen_url'])
+    
+    # Fallback Final: Imagen genérica
+    if not final_image_url:
+        final_image_url = "https://firebasestorage.googleapis.com/v0/b/f1-porra-app-links.firebasestorage.app/o/noticias%2Fgeneric.png?alt=media&token=0f3eb51a-a024-48d9-8251-eb737f1a50b5"
+
+    # 3. Guardar en BD
+    conn = None
+    try:
+        conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
+        cur = conn.cursor()
+        sql = """
+            INSERT INTO noticia (
+                imagen_url,
+                titulo_es, titulo_en, titulo_fr, titulo_pt, titulo_ca,
+                cuerpo_es, cuerpo_en, cuerpo_fr, cuerpo_pt, cuerpo_ca
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        cur.execute(sql, (
+            final_image_url,
+            data.get('titulo_es'), data.get('titulo_en'), data.get('titulo_fr'), data.get('titulo_pt'), data.get('titulo_ca'),
+            data.get('cuerpo_es'), data.get('cuerpo_en'), data.get('cuerpo_fr'), data.get('cuerpo_pt'), data.get('cuerpo_ca')
+        ))
+        conn.commit()
+        cur.close()
+
+        # 4. Notificar
+        if thread_pool_executor:
+            thread_pool_executor.submit(send_fcm_news_notification_task, data)
+
+        return jsonify({"status": "success", "mensaje": "Noticia generada y publicada"}), 200
+
+    except Exception as e:
+        print(f"Error publicando noticia: {e}")
+        if conn: conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if conn: conn.close()
+
+# Endpoint para que la App lea las noticias
+@app.route('/api/news', methods=['GET'])
+@jwt_required()
+def obtener_noticias():
+    page = request.args.get('page', 1, type=int)
+    limit = 10
+    offset = (page - 1) * limit
+    
+    conn = None
+    try:
+        conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute("SELECT * FROM noticia ORDER BY fecha_publicacion DESC LIMIT %s OFFSET %s", (limit, offset))
+        rows = cur.fetchall()
+        
+        news_list = []
+        for r in rows:
+            item = dict(r)
+            if item['fecha_publicacion']: item['fecha_publicacion'] = item['fecha_publicacion'].isoformat()
+            news_list.append(item)
+            
+        return jsonify(news_list), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if conn: conn.close()
+
 # Inicializa la variable scheduler globalmente para que atexit pueda accederla
 scheduler = None
 
@@ -5247,6 +6192,15 @@ if os.environ.get('RUN_SCHEDULER', 'false').lower() == 'true':
             trigger=IntervalTrigger(minutes=30), # O tu intervalo deseado
             id='betting_closed_check_job',
             name='Check betting closed and notify users',
+            replace_existing=True
+        )
+
+        # --- Job para sincronizar clasificaciones F1 (pilotos + constructores) ---
+        scheduler.add_job(
+            func=sync_f1_standings_job,
+            trigger=IntervalTrigger(hours=12),  # Ajusta si quieres más/menos frecuencia
+            id='f1_standings_sync_job',
+            name='Sync F1 standings (drivers & constructors) from Jolpica',
             replace_existing=True
         )
 

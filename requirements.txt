@@ -7,6 +7,7 @@ Werkzeug
 pytz
 gunicorn  # ¡NUEVO y MUY IMPORTANTE!
 python-dotenv # Opcional, para cargar variables de entorno localmente
-firebase-admin
+firebase-admin>=6.6.0
 flask_executor
 APScheduler
+curl_cffi>=0.5.10  # <--- AÑADE ESTA LÍNEA AL FINAL
