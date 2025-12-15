@@ -29,6 +29,8 @@ import tempfile
 from curl_cffi import requests as cffi_requests # Importamos esto para la descarga potente
 import base64
 import urllib.parse # Para codificar el texto del prompt
+import math # Necesario para cálculos si fuera el caso, aunque usaremos lógica simple
+# Asegúrate de que 'datetime', 'timezone' y 'ZoneInfo' estén ya importados correctamente arriba.
 
 # Configurar logging para ver mensajes de APScheduler (opcional pero útil)
 logging.basicConfig(level=logging.INFO)
@@ -879,40 +881,59 @@ def check_deadlines_and_notify():
                 users_needing_reminder_in_porra = participants_in_porra - users_who_bet_in_porra
 
                 if users_needing_reminder_in_porra:
-                    # print(f"      TAREA DEADLINE: {len(users_needing_reminder_in_porra)} usuarios necesitan recordatorio en porra {id_porra}.")
-                    # Obtener tokens FCM para estos usuarios si aún no los tenemos para esta carrera
-                    user_ids_to_query_tokens = list(users_needing_reminder_in_porra - unique_users_needing_reminder_for_race.keys())
-                    if user_ids_to_query_tokens:
-                        placeholders = ','.join(['%s'] * len(user_ids_to_query_tokens))
+                    # Obtener tokens Y ZONA HORARIA para estos usuarios
+                    user_ids_to_query = list(users_needing_reminder_in_porra - unique_users_needing_reminder_for_race.keys())
+                    if user_ids_to_query:
+                        placeholders = ','.join(['%s'] * len(user_ids_to_query))
+                        # --- CAMBIO: Añadido 'timezone' a la consulta ---
                         sql_get_tokens = f"""
-                            SELECT id_usuario, fcm_token, language_code
+                            SELECT id_usuario, fcm_token, language_code, timezone
                             FROM usuario
                             WHERE id_usuario IN ({placeholders})
                               AND fcm_token IS NOT NULL AND fcm_token != '';
                         """
-                        cur.execute(sql_get_tokens, tuple(user_ids_to_query_tokens))
+                        cur.execute(sql_get_tokens, tuple(user_ids_to_query))
                         tokens_found = cur.fetchall()
                         for row in tokens_found:
                             unique_users_needing_reminder_for_race[row['id_usuario']] = {
                                 "token": row['fcm_token'],
-                                "lang": (row['language_code'] or 'es').strip().lower()
+                                "lang": (row['language_code'] or 'es').strip().lower(),
+                                "tz": row['timezone'] or 'Europe/Madrid' # Por defecto Madrid si no tiene
                             }
             
-            # Enviar notificaciones masivas UNA VEZ por carrera con los tokens únicos recolectados
-            # Envío por usuario respetando el idioma
-            pairs = [(v["token"], v["lang"]) for v in unique_users_needing_reminder_for_race.values()
-                     if isinstance(v, dict) and v.get("token")]
-            if pairs:
-                print(f"  TAREA DEADLINE: Enviando recordatorio (i18n) para {len(pairs)} usuarios únicos para la carrera '{desc_carrera}'.")
+            # Enviar notificaciones personalizadas por hora
+            if unique_users_needing_reminder_for_race:
+                print(f"  TAREA DEADLINE: Enviando a {len(unique_users_needing_reminder_for_race)} usuarios.")
+                
                 data_payload = {
                     'tipo_notificacion': 'deadline_reminder',
                     'race_name': desc_carrera,
                     'race_id': str(id_carrera),
                     'ano_carrera': str(ano_carrera)
                 }
-                for token, lang in pairs:
+
+                for user_id, info in unique_users_needing_reminder_for_race.items():
                     try:
-                        title, body = _fcm_text('deadline_reminder', lang, race=desc_carrera, deadline=fecha_limite_str)
+                        token = info["token"]
+                        lang = info["lang"]
+                        user_tz_str = info["tz"]
+
+                        # 1. Calcular la hora local para ESTE usuario
+                        try:
+                            # Intentar usar la zona horaria del usuario
+                            user_tz = ZoneInfo(user_tz_str)
+                        except Exception:
+                            # Si falla (ej: nombre raro), usar Madrid como respaldo
+                            user_tz = ZoneInfo("Europe/Madrid")
+                        
+                        # Convertir la fecha límite (que ya es aware) a la zona del usuario
+                        local_deadline = fecha_limite_aware.astimezone(user_tz)
+                        # Formatear hora: "14:00" o "10:00"
+                        local_deadline_str = local_deadline.strftime('%H:%M')
+
+                        # 2. Generar texto
+                        title, body = _fcm_text('deadline_reminder', lang, race=desc_carrera, deadline=local_deadline_str)
+
                         message = messaging.Message(
                             notification=messaging.Notification(title=title, body=body),
                             data=data_payload,
@@ -920,9 +941,9 @@ def check_deadlines_and_notify():
                         )
                         thread_pool_executor.submit(_send_single_reminder_task, message)
                     except Exception as err:
-                        print(f"ERROR al programar envío deadline_reminder: {err}")
+                        print(f"ERROR envío individual deadline: {err}")
             else:
-                print(f"  TAREA DEADLINE: No hay nuevos usuarios/tokens que notificar para la carrera '{desc_carrera}'.")
+                print(f"  TAREA DEADLINE: Nadie nuevo a quien notificar para '{desc_carrera}'.")
 
 
     except psycopg2.Error as db_err:
@@ -1845,6 +1866,87 @@ def _award_trophy(user_id, trofeo_codigo, conn, cur, detalles=None):
 # --- FIN: Función _award_trophy MODIFICADA con Logging Extremo ---
 # --- FIN Función Auxiliar MODIFICADA ---
 
+# --- FUNCIONES AUXILIARES CLASIFICACIÓN (NUEVO FASE 2) ---
+
+def _get_q_rules(ano, cur):
+    """Obtiene las reglas de Q1/Q2/Q3 para un año específico."""
+    cur.execute("SELECT q1_eliminated, q2_eliminated, total_drivers FROM configuracion_q WHERE ano = %s;", (str(ano),))
+    row = cur.fetchone()
+    if not row:
+        # Fallback por defecto (Standard F1 actual: 20 pilotos, 5 fuera en Q1, 5 fuera en Q2)
+        return {"q1": 5, "q2": 5, "total": 20}
+    return {"q1": row['q1_eliminated'], "q2": row['q2_eliminated'], "total": row['total_drivers']}
+
+def _calculate_qualifying_points(apuesta_clasificacion, resultado_clasificacion, q_rules):
+    """
+    Calcula los puntos de clasificación (10/5/1).
+    apuesta_clasificacion: Lista de códigos ['VER', 'HAM', ...]
+    resultado_clasificacion: Lista de códigos ['VER', 'HAM', ...] (Del resultado oficial)
+    q_rules: Dict con q1, q2, total.
+    """
+    puntos = 0
+    if not apuesta_clasificacion or not resultado_clasificacion:
+        return 0
+
+    # Definir rangos (índices base 0)
+    # Q3: 0 a (Total - Q1 - Q2 - 1)
+    # Q2: (Total - Q1 - Q2) a (Total - Q1 - 1)
+    # Q1: (Total - Q1) a (Total - 1)
+    
+    cutoff_q3 = q_rules['total'] - q_rules['q1'] - q_rules['q2'] # Ej: 20 - 5 - 5 = 10. Q3 es índices 0-9
+    cutoff_q2 = q_rules['total'] - q_rules['q1']             # Ej: 20 - 5 = 15. Q2 es índices 10-14. Q1 es 15-19
+
+    # Mapa de posición real para búsqueda rápida: {'VER': 0, 'HAM': 1...}
+    mapa_resultado = {piloto: idx for idx, piloto in enumerate(resultado_clasificacion)}
+
+    for idx_apuesta, piloto in enumerate(apuesta_clasificacion):
+        if piloto not in mapa_resultado:
+            continue # El piloto no corrió o no está en resultados
+            
+        idx_real = mapa_resultado[piloto]
+
+        # 1. Poleman (Solo si el usuario lo puso primero Y quedó primero)
+        if idx_apuesta == 0 and idx_real == 0:
+            puntos += 10
+            continue # No suma los otros puntos si ya sumó 10
+
+        # 2. Posición Exacta (para el resto, o si no fue pole)
+        if idx_apuesta == idx_real:
+            puntos += 5
+            continue
+
+        # 3. Acierto de Rango (Q1/Q2/Q3)
+        # Determinar rango apuesta
+        rango_apuesta = 0 # 3=Q3, 2=Q2, 1=Q1
+        if idx_apuesta < cutoff_q3: rango_apuesta = 3
+        elif idx_apuesta < cutoff_q2: rango_apuesta = 2
+        else: rango_apuesta = 1
+
+        # Determinar rango real
+        rango_real = 0
+        if idx_real < cutoff_q3: rango_real = 3
+        elif idx_real < cutoff_q2: rango_real = 2
+        else: rango_real = 1
+
+        if rango_apuesta == rango_real:
+            puntos += 1
+
+    return puntos
+
+@app.route('/api/config/q-rules/<string:year>', methods=['GET'])
+def get_q_rules_config(year):
+    conn = None
+    try:
+        conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        rules = _get_q_rules(year, cur)
+        cur.close()
+        return jsonify(rules), 200
+    except Exception as e:
+        print(f"Error getting Q rules: {e}")
+        return jsonify({"error": "Error interno"}), 500
+    finally:
+        if conn: conn.close()
 
 # --- Endpoint GET /api/usuarios (MODIFICADO para búsqueda paginada y exclusiones) ---
 @app.route('/api/usuarios', methods=['GET'])
@@ -2225,13 +2327,13 @@ def obtener_carreras():
                 id_carrera,
                 ano,
                 desc_carrera,
-                fecha_limite_apuesta,
-                resultado_detallado, -- <<<< AÑADIDO
-                -- También incluimos las columnas antiguas por si alguna parte aún las usa
+                fecha_limite_apuesta, -- Esto es Clasificación (Sábado)
+                fecha_limite_carrera, -- NUEVO: Esto es Carrera (Domingo)
+                resultado_detallado,
                 posiciones,
                 vrapida
             FROM carrera
-            ORDER BY ano DESC, id_carrera ASC; -- Ordenar año descendente
+            ORDER BY ano DESC, id_carrera ASC;
         """
         cur.execute(sql_query)
 
@@ -2245,6 +2347,8 @@ def obtener_carreras():
             # Formatear fecha si existe
             if 'fecha_limite_apuesta' in carrera_dict and isinstance(carrera_dict['fecha_limite_apuesta'], datetime):
                  carrera_dict['fecha_limite_apuesta'] = carrera_dict['fecha_limite_apuesta'].isoformat()
+            if 'fecha_limite_carrera' in carrera_dict and isinstance(carrera_dict['fecha_limite_carrera'], datetime):
+                 carrera_dict['fecha_limite_carrera'] = carrera_dict['fecha_limite_carrera'].isoformat()
 
             # El campo resultado_detallado (JSONB) debería ser manejado correctamente por DictCursor
             # como un diccionario Python si no es NULL. No se necesita conversión extra aquí.
@@ -2462,6 +2566,7 @@ L’equip de F1 Porra App
             conn.close()
 
 # --- Endpoint POST /api/porras/<id_porra>/apuestas (MODIFICADO v7 - Lógica Estado Apuesta Mejorada) ---
+# --- Endpoint POST /api/porras/<id_porra>/apuestas (MODIFICADO v8 - Fix error cast text[] to jsonb) ---
 @app.route('/api/porras/<int:id_porra>/apuestas', methods=['POST'])
 @jwt_required()
 def registrar_o_actualizar_apuesta(id_porra):
@@ -2471,11 +2576,14 @@ def registrar_o_actualizar_apuesta(id_porra):
     if not request.is_json: return jsonify({"error": "La solicitud debe ser JSON"}), 400
     data = request.get_json()
     id_carrera = data.get('id_carrera')
-    posiciones_input = data.get('posiciones')
-    vrapida = data.get('vrapida')
-    if not all([id_carrera, isinstance(posiciones_input, list), vrapida]): return jsonify({"error": "Faltan datos (id_carrera, posiciones, vrapida) o 'posiciones' no es lista"}), 400
-    if not isinstance(id_carrera, int) or not isinstance(vrapida, str) or not vrapida: return jsonify({"error": "Tipos de datos inválidos"}), 400
-    if not all(isinstance(p, str) and p for p in posiciones_input): return jsonify({"error": "'posiciones' debe contener strings no vacíos."}), 400
+    
+    # Datos opcionales (pueden venir unos, otros o ambos)
+    posiciones_carrera = data.get('posiciones') # Array carrera
+    posiciones_clasificacion = data.get('posiciones_clasificacion') # Array clasificación
+    vrapida = data.get('vrapida') # String
+
+    if not id_carrera or not isinstance(id_carrera, int):
+        return jsonify({"error": "Falta id_carrera o es inválido"}), 400
 
     conn = None
     cur = None
@@ -2487,145 +2595,135 @@ def registrar_o_actualizar_apuesta(id_porra):
         try: id_usuario_actual_int = int(id_usuario_actual)
         except (ValueError, TypeError): return jsonify({"error": "Error interno autorización."}), 500
 
-        # --- 1. Info Porra + Datos Admin (NUEVO: Join con usuario para token admin) ---
-        sql_porra = """
-            SELECT p.ano, p.tipo_porra, p.nombre_porra, p.id_creador,
-                   u.fcm_token as admin_token, u.language_code as admin_lang
-            FROM porra p
-            JOIN usuario u ON p.id_creador = u.id_usuario
-            WHERE p.id_porra = %s;
-        """
+        # --- 1. Info Porra ---
+        sql_porra = "SELECT tipo_porra FROM porra WHERE id_porra = %s;"
         cur.execute(sql_porra, (id_porra,))
         porra_info = cur.fetchone()
         if porra_info is None: return jsonify({"error": "Porra no encontrada"}), 404
-        
         tipo_porra_actual = porra_info['tipo_porra']
-        nombre_porra = porra_info['nombre_porra']
-        ano_porra = porra_info['ano']
-        id_creador = porra_info['id_creador']
-        admin_token = porra_info['admin_token']
-        admin_lang = porra_info['admin_lang']
 
-        # --- 2. Info Usuario Actual (NUEVO: Nombre para la notificación) ---
-        cur.execute("SELECT nombre FROM usuario WHERE id_usuario = %s;", (id_usuario_actual_int,))
-        user_row = cur.fetchone()
-        nombre_usuario_actual = user_row['nombre'] if user_row else "Usuario"
-
-        # --- 3. Info Carrera ---
-        cur.execute("SELECT ano, fecha_limite_apuesta, desc_carrera FROM carrera WHERE id_carrera = %s;", (id_carrera,))
+        # --- 2. Info Carrera y Fechas Límite ---
+        cur.execute("SELECT ano, fecha_limite_apuesta, fecha_limite_carrera FROM carrera WHERE id_carrera = %s;", (id_carrera,))
         carrera_info = cur.fetchone()
         if carrera_info is None: return jsonify({"error": "Carrera no encontrada"}), 404
-        ano_carrera = carrera_info['ano']
-        fecha_limite_db = carrera_info['fecha_limite_apuesta']
-        nombre_carrera = carrera_info['desc_carrera']
-
-        # --- Validación Pilotos (Igual que antes) ---
-        active_drivers_for_race = set()
-        expected_driver_count_for_race = 0
-        sql_race_drivers = "SELECT codigo_piloto FROM piloto_carrera_detalle WHERE id_carrera = %s AND activo_para_apuesta = TRUE;"
-        cur.execute(sql_race_drivers, (id_carrera,))
-        pilotos_activos_db = cur.fetchall()
-        if pilotos_activos_db: active_drivers_for_race = {p['codigo_piloto'] for p in pilotos_activos_db}; expected_driver_count_for_race = len(active_drivers_for_race)
-        else:
-            sql_season_drivers = "SELECT codigo_piloto FROM piloto_temporada WHERE ano = %s;"
-            cur.execute(sql_season_drivers, (ano_carrera,))
-            pilotos_temporada_db = cur.fetchall()
-            if not pilotos_temporada_db: return jsonify({"error": f"No hay pilotos definidos para carrera {id_carrera} o temporada {ano_carrera}."}), 409
-            active_drivers_for_race = {p['codigo_piloto'] for p in pilotos_temporada_db}; expected_driver_count_for_race = len(active_drivers_for_race)
         
-        if len(posiciones_input) != expected_driver_count_for_race: return jsonify({"error": f"Número incorrecto de posiciones. Se esperaban {expected_driver_count_for_race}."}), 400
-        if not all(p_code in active_drivers_for_race for p_code in posiciones_input): invalid_codes = [p for p in posiciones_input if p not in active_drivers_for_race]; return jsonify({"error": f"Códigos de piloto inválidos/inactivos en posiciones: {invalid_codes}"}), 400
-        if vrapida not in active_drivers_for_race: return jsonify({"error": f"Piloto de vuelta rápida '{vrapida}' inválido/inactivo."}), 400
+        fecha_limite_clasif_db = carrera_info['fecha_limite_apuesta']
+        fecha_limite_carrera_db = carrera_info['fecha_limite_carrera']
+        
+        # Gestión de zonas horarias
+        try: from zoneinfo import ZoneInfo
+        except ImportError: from pytz import timezone as ZoneInfo
+        now_utc = datetime.now(timezone.utc)
 
-        # --- Membresía ---
+        # Validar fechas si existen en DB
+        is_clasif_open = True
+        is_race_open = True
+
+        if fecha_limite_clasif_db:
+            if fecha_limite_clasif_db.tzinfo is None: fecha_limite_clasif_db = fecha_limite_clasif_db.replace(tzinfo=timezone.utc)
+            if now_utc > fecha_limite_clasif_db: is_clasif_open = False
+        
+        if fecha_limite_carrera_db:
+            if fecha_limite_carrera_db.tzinfo is None: fecha_limite_carrera_db = fecha_limite_carrera_db.replace(tzinfo=timezone.utc)
+            if now_utc > fecha_limite_carrera_db: is_race_open = False
+        else:
+            if not is_clasif_open: is_race_open = False 
+
+        # --- 3. Membresía ---
         sql_check_membership = "SELECT 1 FROM participacion WHERE id_porra = %s AND id_usuario = %s AND estado IN ('CREADOR', 'ACEPTADA');"
         cur.execute(sql_check_membership, (id_porra, id_usuario_actual_int))
         if cur.fetchone() is None: return jsonify({"error": "No eres miembro activo."}), 403
 
-        # --- Fecha Límite ---
-        if fecha_limite_db is None: return jsonify({"error": "Fecha límite no definida."}), 409
-        try: from zoneinfo import ZoneInfo
-        except ImportError: from pytz import timezone as ZoneInfo
-        try: tz_madrid = ZoneInfo("Europe/Madrid")
-        except Exception: tz_madrid = timezone.utc
-        now_local = datetime.now(tz_madrid)
-        if fecha_limite_db.tzinfo is None: fecha_limite_db = fecha_limite_db.replace(tzinfo=timezone.utc)
-        if now_local.tzinfo is None: now_local = now_local.replace(tzinfo=timezone.utc)
-        if now_local.astimezone(timezone.utc) > fecha_limite_db.astimezone(timezone.utc): return jsonify({"error": "Fecha límite pasada."}), 409
-
-        # --- Lógica de Estado Apuesta ---
-        estado_final_apuesta = 'PENDIENTE'
-        fecha_estado_final = None
-        now_utc_db = datetime.now(timezone.utc)
-
-        cur.execute("SELECT estado_apuesta FROM apuesta WHERE id_porra = %s AND id_carrera = %s AND id_usuario = %s;",
+        # --- 4. Preparar Upsert ---
+        cur.execute("SELECT posiciones, posiciones_clasificacion, vrapida, estado_apuesta FROM apuesta WHERE id_porra=%s AND id_carrera=%s AND id_usuario=%s", 
                     (id_porra, id_carrera, id_usuario_actual_int))
         apuesta_previa = cur.fetchone()
 
+        # Valores finales a guardar (default a lo que ya había o null)
+        final_pos_carrera = apuesta_previa['posiciones'] if apuesta_previa else None
+        final_pos_clasif = apuesta_previa['posiciones_clasificacion'] if apuesta_previa else None
+        final_vr = apuesta_previa['vrapida'] if apuesta_previa else None
+
+        # --- CORRECCIÓN CRÍTICA: Convertir a JSON String si vienen de DB como lista/dict ---
+        # Psycopg2 devuelve jsonb como listas de Python. Si las pasamos a la query con ::jsonb,
+        # intenta hacer cast de Array a Jsonb y falla. Debemos pasarlas como STRING JSON.
+        if isinstance(final_pos_carrera, (list, dict)):
+            final_pos_carrera = json.dumps(final_pos_carrera)
+        
+        if isinstance(final_pos_clasif, (list, dict)):
+            final_pos_clasif = json.dumps(final_pos_clasif)
+        # ----------------------------------------------------------------------------------
+        
+        # Validar y asignar CLASIFICACIÓN (Sobrescribe si hay input nuevo)
+        if posiciones_clasificacion is not None:
+            if not is_clasif_open:
+                return jsonify({"error": "La clasificación ya ha cerrado."}), 409
+            if not isinstance(posiciones_clasificacion, list):
+                return jsonify({"error": "Formato inválido para clasificación"}), 400
+            final_pos_clasif = json.dumps(posiciones_clasificacion)
+
+        # Validar y asignar CARRERA (Sobrescribe si hay input nuevo)
+        if posiciones_carrera is not None:
+            if not is_race_open:
+                return jsonify({"error": "La carrera ya ha cerrado."}), 409
+            if not isinstance(posiciones_carrera, list):
+                return jsonify({"error": "Formato inválido para carrera"}), 400
+            final_pos_carrera = json.dumps(posiciones_carrera)
+            
+        # VR va ligado a carrera
+        if vrapida is not None:
+            if not is_race_open:
+                 return jsonify({"error": "La carrera ya ha cerrado (VR)."}), 409
+            final_vr = vrapida
+
+        # Lógica Estado Apuesta
+        estado_final = 'PENDIENTE'
+        fecha_estado = None
+        
         if tipo_porra_actual in ['PUBLICA', 'PRIVADA_AMISTOSA']:
-            estado_final_apuesta = 'ACEPTADA'
-            fecha_estado_final = now_utc_db
+            estado_final = 'ACEPTADA'
+            fecha_estado = now_utc
         elif tipo_porra_actual == 'PRIVADA_ADMINISTRADA':
             if apuesta_previa and apuesta_previa['estado_apuesta'] == 'ACEPTADA':
-                estado_final_apuesta = 'ACEPTADA'
-                fecha_estado_final = now_utc_db
+                estado_final = 'ACEPTADA' 
+                fecha_estado = now_utc
             else:
-                estado_final_apuesta = 'PENDIENTE'
-                fecha_estado_final = None
+                estado_final = 'PENDIENTE'
 
         # Lógica Trofeo Primera Apuesta
         should_award_first_bet_trophy = False
-        cur.execute("SELECT COUNT(*) FROM apuesta WHERE id_usuario = %s;", (id_usuario_actual_int,))
-        if cur.fetchone()[0] == 0 and not apuesta_previa :
-            should_award_first_bet_trophy = True
+        if not apuesta_previa:
+            cur.execute("SELECT COUNT(*) FROM apuesta WHERE id_usuario = %s;", (id_usuario_actual_int,))
+            if cur.fetchone()[0] == 0: should_award_first_bet_trophy = True
 
-        # --- Upsert Apuesta ---
+        # --- EJECUTAR UPSERT ---
         sql_upsert = """
-            INSERT INTO apuesta (id_porra, id_carrera, id_usuario, posiciones, vrapida, estado_apuesta, fecha_estado_apuesta, fecha_modificacion)
-            VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s)
+            INSERT INTO apuesta (id_porra, id_carrera, id_usuario, posiciones, posiciones_clasificacion, vrapida, estado_apuesta, fecha_estado_apuesta, fecha_modificacion)
+            VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s)
             ON CONFLICT (id_porra, id_carrera, id_usuario) DO UPDATE SET
-                posiciones = EXCLUDED.posiciones, vrapida = EXCLUDED.vrapida,
-                estado_apuesta = EXCLUDED.estado_apuesta, fecha_estado_apuesta = EXCLUDED.fecha_estado_apuesta,
+                posiciones = EXCLUDED.posiciones,
+                posiciones_clasificacion = EXCLUDED.posiciones_clasificacion,
+                vrapida = EXCLUDED.vrapida,
+                estado_apuesta = EXCLUDED.estado_apuesta,
                 fecha_modificacion = EXCLUDED.fecha_modificacion;
         """
-        posiciones_json = json.dumps(posiciones_input)
-        valores = (id_porra, id_carrera, id_usuario_actual_int, posiciones_json, vrapida, estado_final_apuesta, fecha_estado_final, now_utc_db)
+        valores = (id_porra, id_carrera, id_usuario_actual_int, final_pos_carrera, final_pos_clasif, final_vr, estado_final, fecha_estado, now_utc)
         cur.execute(sql_upsert, valores)
 
         if should_award_first_bet_trophy:
-             if not _award_trophy(id_usuario_actual_int, 'PRIMERA_APUESTA', conn, cur):
-                print(f"WARN: _award_trophy (PRIMERA_APUESTA) retornó False.")
-
-        # --- NOTIFICACIÓN AL ADMIN (NUEVO) ---
-        # Solo si es administrada, queda pendiente y quien apuesta NO es el propio admin
-        if tipo_porra_actual == 'PRIVADA_ADMINISTRADA' and estado_final_apuesta == 'PENDIENTE' and id_usuario_actual_int != id_creador:
-            if admin_token and thread_pool_executor:
-                thread_pool_executor.submit(
-                    send_fcm_new_bet_admin_notification_task,
-                    id_creador, admin_token, nombre_carrera, nombre_porra, nombre_usuario_actual,
-                    id_porra, ano_porra, id_creador, tipo_porra_actual, # Datos para que Flutter navegue
-                    admin_lang
-                )
+             _award_trophy(id_usuario_actual_int, 'PRIMERA_APUESTA', conn, cur)
 
         conn.commit()
-        mensaje_respuesta = "Apuesta registrada/actualizada correctamente."
-        if tipo_porra_actual == 'PRIVADA_ADMINISTRADA' and estado_final_apuesta == 'PENDIENTE':
-            mensaje_respuesta += " Pendiente de aprobación por el creador."
+        return jsonify({"mensaje": "Apuesta guardada correctamente."}), 201
 
-        return jsonify({"mensaje": mensaje_respuesta}), 201
-
-    except psycopg2.Error as db_error:
-        print(f"ERROR DB [Registrar Apuesta]: {db_error}")
-        if conn: conn.rollback()
-        return jsonify({"error": "Error de base de datos al registrar apuesta"}), 500
     except Exception as error:
         print(f"ERROR General [Registrar Apuesta]: {error}")
-        import traceback; traceback.print_exc()
+        import traceback; traceback.print_exc() # Imprimir detalle para debug
         if conn: conn.rollback()
         return jsonify({"error": "Error interno al registrar apuesta"}), 500
     finally:
-        if cur is not None and not cur.closed: cur.close()
-        if conn is not None and not conn.closed: conn.close()
+        if cur is not None: cur.close()
+        if conn is not None: conn.close()
 # --- FIN Endpoint POST Apuestas MODIFICADO ---
 
 # --- NUEVO Endpoint POST /api/login ---
@@ -2793,25 +2891,22 @@ def crear_porra():
 @app.route('/api/porras/<int:id_porra>/carreras/<int:id_carrera>/apuesta', methods=['GET'])
 @jwt_required()
 def obtener_mi_apuesta(id_porra, id_carrera):
-    id_usuario_actual = get_jwt_identity() # String
-    try:
-        id_usuario_actual_int = int(id_usuario_actual)
-    except (ValueError, TypeError):
-        return jsonify({"error": "Token de usuario inválido"}), 400
+    id_usuario_actual = get_jwt_identity() 
+    try: id_usuario_actual_int = int(id_usuario_actual)
+    except: return jsonify({"error": "Token inválido"}), 400
 
     conn = None
     try:
         conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-        # Verificar membresía (sin cambios)
         sql_check_membership = "SELECT 1 FROM participacion WHERE id_porra = %s AND id_usuario = %s AND estado IN ('CREADOR', 'ACEPTADA');"
         cur.execute(sql_check_membership, (id_porra, id_usuario_actual_int))
         if cur.fetchone() is None: return jsonify({"error": "No eres miembro activo."}), 403
 
-        # --- MODIFICADO: Obtener estado_apuesta ---
+        # Seleccionamos también posiciones_clasificacion
         sql_get_bet = """
-            SELECT id_apuesta, id_porra, id_carrera, id_usuario, posiciones, vrapida, estado_apuesta
+            SELECT id_apuesta, id_porra, id_carrera, id_usuario, posiciones, posiciones_clasificacion, vrapida, estado_apuesta
             FROM apuesta
             WHERE id_porra = %s AND id_carrera = %s AND id_usuario = %s;
         """
@@ -2820,40 +2915,40 @@ def obtener_mi_apuesta(id_porra, id_carrera):
         cur.close()
 
         if apuesta:
-            try:
-                # Parsear JSONB (sin cambios)
-                pos_data = apuesta['posiciones']
-                posiciones_list = []
-                if isinstance(pos_data, str): posiciones_list = json.loads(pos_data)
-                elif isinstance(pos_data, list): posiciones_list = pos_data
-                elif isinstance(pos_data, dict) and all(isinstance(k, int) for k in pos_data.keys()): posiciones_list = [pos_data[k] for k in sorted(pos_data.keys())]
-                else: raise TypeError("Tipo inesperado para 'posiciones'")
+            # Parsear JSONB posiciones (Carrera)
+            pos_data = apuesta['posiciones']
+            posiciones_list = []
+            if isinstance(pos_data, str): posiciones_list = json.loads(pos_data)
+            elif isinstance(pos_data, list): posiciones_list = pos_data
+            
+            # Parsear JSONB posiciones_clasificacion (NUEVO)
+            pos_class_data = apuesta['posiciones_clasificacion']
+            posiciones_class_list = []
+            if isinstance(pos_class_data, str): posiciones_class_list = json.loads(pos_class_data)
+            elif isinstance(pos_class_data, list): posiciones_class_list = pos_class_data
 
-                resultado_json = {
-                    "id_apuesta": apuesta["id_apuesta"], "id_porra": apuesta["id_porra"],
-                    "id_carrera": apuesta["id_carrera"], "id_usuario": apuesta["id_usuario"],
-                    "posiciones": posiciones_list, "vrapida": apuesta["vrapida"],
-                    "estado_apuesta": apuesta["estado_apuesta"] # <<< AÑADIDO
-                }
-                return jsonify(resultado_json), 200
-            except (json.JSONDecodeError, TypeError, KeyError) as e:
-                 print(f"Error procesando apuesta {apuesta.get('id_apuesta')}: {e}")
-                 return jsonify({"error": "Error procesando datos de apuesta recuperados"}), 500
+            resultado_json = {
+                "id_apuesta": apuesta["id_apuesta"],
+                "id_porra": apuesta["id_porra"],
+                "id_carrera": apuesta["id_carrera"],
+                "id_usuario": apuesta["id_usuario"],
+                "posiciones": posiciones_list,
+                "posiciones_clasificacion": posiciones_class_list, # NUEVO
+                "vrapida": apuesta["vrapida"],
+                "estado_apuesta": apuesta["estado_apuesta"]
+            }
+            return jsonify(resultado_json), 200
         else:
-            return jsonify({"error": "No se encontró apuesta para esta carrera/porra"}), 404
+            return jsonify({"error": "No se encontró apuesta"}), 404
 
-    except psycopg2.DatabaseError as db_error: # Sin cambios manejo error
-        print(f"Error DB en obtener_mi_apuesta: {db_error}")
-        return jsonify({"error": "Error de base de datos al obtener la apuesta"}), 500
-    except Exception as error: # Sin cambios manejo error
-        print(f"Error general en obtener_mi_apuesta: {error}")
-        import traceback; traceback.print_exc()
-        return jsonify({"error": "Error interno al obtener la apuesta"}), 500
-    finally: # Sin cambios finally
-        if conn is not None and not conn.closed:
-            conn.close()
+    except Exception as error:
+        print(f"Error en obtener_mi_apuesta: {error}")
+        return jsonify({"error": "Error interno"}), 500
+    finally:
+        if conn: conn.close()
 
 # --- Endpoint GET /api/porras/.../apuestas/todas (MODIFICADO v2 con estado_apuesta) ---
+# --- Endpoint GET /api/porras/.../apuestas/todas (MODIFICADO v3 con posiciones_clasificacion) ---
 @app.route('/api/porras/<int:id_porra>/carreras/<int:id_carrera>/apuestas/todas', methods=['GET'])
 @jwt_required()
 def obtener_todas_apuestas_carrera(id_porra, id_carrera):
@@ -2869,7 +2964,6 @@ def obtener_todas_apuestas_carrera(id_porra, id_carrera):
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
         # --- Validaciones (Carrera, Membresía, Fecha Límite - sin cambios) ---
-        # ... (código de validaciones existente) ...
         cur.execute("SELECT fecha_limite_apuesta FROM carrera WHERE id_carrera = %s;", (id_carrera,))
         carrera_info = cur.fetchone() 
         if carrera_info is None: 
@@ -2886,19 +2980,22 @@ def obtener_todas_apuestas_carrera(id_porra, id_carrera):
         now_local = datetime.now(tz_madrid) 
         if fecha_limite_db.tzinfo is None: 
             fecha_limite_db = fecha_limite_db.replace(tzinfo=timezone.utc)
+        
+        # Validamos contra la fecha de clasificación (la primera fecha de corte)
         if now_local.astimezone(timezone.utc) <= fecha_limite_db.astimezone(timezone.utc): 
             return jsonify({ "error": "No se pueden ver apuestas hasta después de la fecha límite.", "fecha_limite": fecha_limite_db.isoformat(), }), 403
         # --- Fin Validaciones ---
 
-        # --- Obtener TODAS las apuestas (Añadir estado_apuesta) ---
+        # --- Obtener TODAS las apuestas (Añadir estado_apuesta y posiciones_clasificacion) ---
         sql_get_all_bets = """
             SELECT
                 u.id_usuario,
                 u.nombre AS nombre_usuario,
                 a.id_apuesta,
                 a.posiciones,
+                a.posiciones_clasificacion, -- <<< AÑADIDO
                 a.vrapida,
-                a.estado_apuesta -- <<< AÑADIDO
+                a.estado_apuesta
             FROM apuesta a
             JOIN usuario u ON a.id_usuario = u.id_usuario
             WHERE a.id_porra = %s AND a.id_carrera = %s
@@ -2908,24 +3005,31 @@ def obtener_todas_apuestas_carrera(id_porra, id_carrera):
         todas_apuestas = cur.fetchall()
         cur.close()
 
-        # --- Formatear la respuesta (incluir estado_apuesta) ---
+        # --- Formatear la respuesta ---
         lista_apuestas_formateada = []
         for apuesta in todas_apuestas:
             try:
+                # Parsear JSONB Carrera
                 pos_data = apuesta['posiciones']
-                posiciones_list = [] # Parsear JSONB (código existente)
+                posiciones_list = [] 
                 if isinstance(pos_data, str): posiciones_list = json.loads(pos_data)
                 elif isinstance(pos_data, list): posiciones_list = pos_data
                 elif isinstance(pos_data, dict) and all(isinstance(k, int) for k in pos_data.keys()): posiciones_list = [pos_data[k] for k in sorted(pos_data.keys())]
-                else: raise TypeError("Tipo inesperado para 'posiciones'")
+                
+                # Parsear JSONB Clasificación
+                pos_class_data = apuesta['posiciones_clasificacion']
+                posiciones_class_list = []
+                if isinstance(pos_class_data, str): posiciones_class_list = json.loads(pos_class_data)
+                elif isinstance(pos_class_data, list): posiciones_class_list = pos_class_data
 
                 apuesta_formateada = {
                     "id_apuesta": apuesta["id_apuesta"],
                     "id_usuario": apuesta["id_usuario"],
                     "nombre_usuario": apuesta["nombre_usuario"],
                     "posiciones": posiciones_list,
+                    "posiciones_clasificacion": posiciones_class_list, # <<< AÑADIDO
                     "vrapida": apuesta["vrapida"],
-                    "estado_apuesta": apuesta["estado_apuesta"] # <<< AÑADIDO
+                    "estado_apuesta": apuesta["estado_apuesta"]
                 }
                 lista_apuestas_formateada.append(apuesta_formateada)
             except (json.JSONDecodeError, TypeError, KeyError) as e:
@@ -2934,18 +3038,18 @@ def obtener_todas_apuestas_carrera(id_porra, id_carrera):
 
         return jsonify(lista_apuestas_formateada), 200
 
-    except psycopg2.DatabaseError as db_error: # Sin cambios manejo error
+    except psycopg2.DatabaseError as db_error:
         print(f"Error DB en obtener_todas_apuestas_carrera: {db_error}")
         return jsonify({"error": "Error de base de datos al obtener apuestas"}), 500
-    except Exception as error: # Sin cambios manejo error
+    except Exception as error:
         print(f"Error general en obtener_todas_apuestas_carrera: {error}")
         import traceback; traceback.print_exc()
         return jsonify({"error": "Error interno al obtener todas las apuestas"}), 500
-    finally: # Sin cambios finally
+    finally:
         if conn is not None and not conn.closed:
             conn.close()
 
-# --- Endpoint GET /api/carreras/<id_carrera>/resultado (MODIFICADO v2 para usar piloto_carrera_detalle) ---
+# --- Endpoint GET /api/carreras/<id_carrera>/resultado (MODIFICADO v3 para incluir clasificación) ---
 @app.route('/api/carreras/<int:id_carrera>/resultado', methods=['GET'])
 def obtener_resultado_carrera(id_carrera):
     conn = None
@@ -2954,7 +3058,8 @@ def obtener_resultado_carrera(id_carrera):
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
         # 1. Obtener resultado detallado JSONB y AÑO de la carrera
-        sql_race = "SELECT ano, resultado_detallado FROM carrera WHERE id_carrera = %s;"
+        # SELECCIONAMOS TAMBIÉN resultado_detallado_clasificacion
+        sql_race = "SELECT ano, resultado_detallado, resultado_detallado_clasificacion FROM carrera WHERE id_carrera = %s;"
         cur.execute(sql_race, (id_carrera,))
         resultado_db = cur.fetchone()
 
@@ -2963,18 +3068,11 @@ def obtener_resultado_carrera(id_carrera):
             return jsonify({"error": "Carrera no encontrada"}), 404
 
         ano_carrera = resultado_db.get("ano")
-        resultado_detallado_json = resultado_db.get("resultado_detallado") # Puede ser None o un Dict Python
+        resultado_detallado_json = resultado_db.get("resultado_detallado")
+        resultado_clasif_json = resultado_db.get("resultado_detallado_clasificacion")
 
-        # 2. Verificar si los resultados existen (JSONB no es NULL y tiene contenido)
-        if not resultado_detallado_json or not isinstance(resultado_detallado_json, dict) or not ano_carrera:
-            # La carrera existe pero aún no tiene resultados válidos
-            cur.close(); conn.close()
-            return jsonify({ "id_carrera": id_carrera, "status": "pendiente" }), 200 # 200 OK
-
-        # --- Inicio Lógica Modificada para Obtener Detalles de Pilotos ---
-        pilotos_map = {} # Mapa para almacenar detalles: codigo -> {nombre, escuderia, color}
-
-        # 3. PRIMERO: Intentar obtener detalles desde piloto_carrera_detalle para esta carrera específica
+        # --- Obtener Detalles de Pilotos (Lógica existente) ---
+        pilotos_map = {} 
         sql_pilotos_carrera = """
             SELECT codigo_piloto, nombre_completo_carrera, escuderia_carrera, color_fondo_hex_carrera
             FROM piloto_carrera_detalle
@@ -2984,7 +3082,6 @@ def obtener_resultado_carrera(id_carrera):
         pilotos_info_carrera_db = cur.fetchall()
 
         if pilotos_info_carrera_db:
-            print(f"DEBUG [GetResult]: Encontrados {len(pilotos_info_carrera_db)} pilotos en piloto_carrera_detalle para carrera {id_carrera}.")
             for p in pilotos_info_carrera_db:
                 pilotos_map[p['codigo_piloto']] = {
                     'nombre_completo': p.get('nombre_completo_carrera', p['codigo_piloto']),
@@ -2992,9 +3089,6 @@ def obtener_resultado_carrera(id_carrera):
                     'color_escuderia_hex': p.get('color_fondo_hex_carrera', '#CCCCCC')
                 }
         else:
-             # Si no hay NADA en piloto_carrera_detalle para esta carrera (no debería pasar si PUT /resultado funciona)
-             # usamos piloto_temporada como fallback completo.
-            print(f"WARN [GetResult]: No se encontraron pilotos en piloto_carrera_detalle para carrera {id_carrera}. Usando piloto_temporada para {ano_carrera} como fallback.")
             sql_pilotos_temporada = """
                 SELECT codigo_piloto, nombre_completo, escuderia, color_fondo_hex
                 FROM piloto_temporada
@@ -3009,109 +3103,108 @@ def obtener_resultado_carrera(id_carrera):
                     'color_escuderia_hex': p.get('color_fondo_hex', '#CCCCCC')
                  }
 
-        # 4. SEGUNDO: Para pilotos en el resultado que *pudieran* no estar en el mapa (fallback individual)
-        # Esto es una salvaguarda extra por si piloto_carrera_detalle no se pobló correctamente
-        # o si el resultado_detallado_json contiene un piloto inesperado.
-        codigos_en_resultado = set()
-        if 'posiciones_detalle' in resultado_detallado_json and isinstance(resultado_detallado_json['posiciones_detalle'], list):
-            for piloto_res in resultado_detallado_json['posiciones_detalle']:
-                if isinstance(piloto_res, dict) and 'codigo' in piloto_res:
-                    codigos_en_resultado.add(piloto_res['codigo'])
-        if 'vrapida_piloto' in resultado_detallado_json:
-             codigos_en_resultado.add(resultado_detallado_json['vrapida_piloto'])
+        # --- Construir Respuesta ---
+        respuesta_final = {
+            "id_carrera": id_carrera,
+            "status": "pendiente",
+            "carrera": None,
+            "clasificacion": None
+        }
 
-        pilotos_faltantes = codigos_en_resultado - set(pilotos_map.keys())
+        has_race_result = False
+        has_qualy_result = False
 
-        if pilotos_faltantes:
-            print(f"WARN [GetResult]: Los siguientes códigos de piloto del resultado no se encontraron inicialmente: {pilotos_faltantes}. Buscando en piloto_temporada...")
-            placeholders = ','.join(['%s'] * len(pilotos_faltantes))
-            sql_fallback_pilotos = f"""
-                SELECT codigo_piloto, nombre_completo, escuderia, color_fondo_hex
-                FROM piloto_temporada WHERE ano = %s AND codigo_piloto IN ({placeholders});
-            """
-            cur.execute(sql_fallback_pilotos, (ano_carrera, *list(pilotos_faltantes)))
-            pilotos_fallback_db = cur.fetchall()
-            for p in pilotos_fallback_db:
-                pilotos_map[p['codigo_piloto']] = {
-                    'nombre_completo': p.get('nombre_completo', p['codigo_piloto']),
-                    'escuderia': p.get('escuderia', ''),
-                    'color_escuderia_hex': p.get('color_fondo_hex', '#CCCCCC')
+        # Procesar Carrera
+        if resultado_detallado_json and isinstance(resultado_detallado_json, dict):
+            try:
+                posiciones_detalle_db = resultado_detallado_json.get('posiciones_detalle')
+                vrapida_piloto_db = resultado_detallado_json.get('vrapida_piloto')
+                vrapida_tiempo_db = resultado_detallado_json.get('vrapida_tiempo')
+
+                if posiciones_detalle_db and vrapida_piloto_db:
+                    resultado_final_posiciones = []
+                    for piloto_res_db in posiciones_detalle_db:
+                        if not isinstance(piloto_res_db, dict): continue
+                        codigo = piloto_res_db.get('codigo')
+                        if not codigo: continue
+                        piloto_detalle_final = pilotos_map.get(codigo, {'nombre_completo': codigo, 'escuderia': '?', 'color_escuderia_hex': '#CCCCCC'})
+                        resultado_final_posiciones.append({
+                            "posicion": piloto_res_db.get('posicion'),
+                            "codigo": codigo,
+                            "tiempo_str": piloto_res_db.get('tiempo_str'),
+                            "nombre_completo": piloto_detalle_final['nombre_completo'],
+                            "escuderia": piloto_detalle_final['escuderia'],
+                            "color_escuderia_hex": piloto_detalle_final['color_escuderia_hex']
+                        })
+                    
+                    vrapida_piloto_detalle = pilotos_map.get(vrapida_piloto_db, {'nombre_completo': vrapida_piloto_db, 'escuderia': '?', 'color_escuderia_hex': '#CCCCCC'})
+                    
+                    respuesta_final["carrera"] = {
+                        "posiciones_detalle": resultado_final_posiciones,
+                        "vrapida_detalle": {
+                            "codigo": vrapida_piloto_db,
+                            "tiempo_vr": vrapida_tiempo_db,
+                            "nombre_completo": vrapida_piloto_detalle['nombre_completo'],
+                            "color_escuderia_hex": vrapida_piloto_detalle['color_escuderia_hex']
+                        }
+                    }
+                    has_race_result = True
+            except Exception as e:
+                print(f"Error procesando resultado carrera: {e}")
+
+        # Procesar Clasificación
+        if resultado_clasif_json and isinstance(resultado_clasif_json, list):
+            try:
+                # resultado_clasif_json es una LISTA de objetos con {posicion, codigo, q1, q2, q3}
+                resultado_final_clasif = []
+                for item in resultado_clasif_json:
+                    codigo = item.get('codigo')
+                    piloto_detalle = pilotos_map.get(codigo, {'nombre_completo': codigo, 'escuderia': '?', 'color_escuderia_hex': '#CCCCCC'})
+                    
+                    # Determinar el mejor tiempo a mostrar (Q3 > Q2 > Q1)
+                    tiempo_display = item.get('q3') or item.get('q2') or item.get('q1') or '-'
+                    
+                    resultado_final_clasif.append({
+                        "posicion": item.get('posicion'),
+                        "codigo": codigo,
+                        "tiempo_str": tiempo_display, # Tiempo de su última sesión
+                        "q1": item.get('q1'),
+                        "q2": item.get('q2'),
+                        "q3": item.get('q3'),
+                        "nombre_completo": piloto_detalle['nombre_completo'],
+                        "escuderia": piloto_detalle['escuderia'],
+                        "color_escuderia_hex": piloto_detalle['color_escuderia_hex']
+                    })
+                
+                respuesta_final["clasificacion"] = {
+                    "posiciones_detalle": resultado_final_clasif
                 }
-        # --- Fin Lógica Modificada Obtener Detalles Pilotos ---
+                has_qualy_result = True
+            except Exception as e:
+                print(f"Error procesando resultado clasificacion: {e}")
 
-        # 5. Procesar el JSON almacenado y ENRIQUECER con detalles del mapa
-        try:
-            posiciones_detalle_db = resultado_detallado_json.get('posiciones_detalle')
-            vrapida_piloto_db = resultado_detallado_json.get('vrapida_piloto')
-            vrapida_tiempo_db = resultado_detallado_json.get('vrapida_tiempo') # Se mantiene igual
+        if has_race_result or has_qualy_result:
+            respuesta_final["status"] = "finalizada" # Al menos uno está disponible
+        
+        # Compatibilidad hacia atrás (para que la app no rompa antes de actualizarse)
+        if has_race_result:
+            respuesta_final["posiciones_detalle"] = respuesta_final["carrera"]["posiciones_detalle"]
+            respuesta_final["vrapida_detalle"] = respuesta_final["carrera"]["vrapida_detalle"]
 
-            if not isinstance(posiciones_detalle_db, list) or not posiciones_detalle_db or \
-               not isinstance(vrapida_piloto_db, str) or not vrapida_piloto_db or \
-               vrapida_tiempo_db is None: # Tiempo VR puede ser string vacío
-                raise ValueError("JSON de resultado almacenado tiene formato inválido o faltan claves.")
-
-            # 6. Construir la lista de resultados detallada ENRIQUECIDA
-            resultado_final_posiciones = []
-            for piloto_res_db in posiciones_detalle_db:
-                if not isinstance(piloto_res_db, dict): continue
-                codigo = piloto_res_db.get('codigo')
-                if not codigo: continue
-
-                # Obtener detalles del mapa (que prioriza piloto_carrera_detalle)
-                piloto_detalle_final = pilotos_map.get(codigo, {
-                    'nombre_completo': codigo, 'escuderia': '?', 'color_escuderia_hex': '#CCCCCC' # Fallback final
-                })
-
-                resultado_final_posiciones.append({
-                    "posicion": piloto_res_db.get('posicion'),
-                    "codigo": codigo,
-                    "tiempo_str": piloto_res_db.get('tiempo_str'),
-                    "nombre_completo": piloto_detalle_final['nombre_completo'],
-                    "escuderia": piloto_detalle_final['escuderia'],
-                    "color_escuderia_hex": piloto_detalle_final['color_escuderia_hex']
-                })
-
-            # 7. Construir detalles del piloto de la vuelta rápida ENRIQUECIDO
-            vrapida_piloto_detalle_final = pilotos_map.get(vrapida_piloto_db, {
-                'nombre_completo': vrapida_piloto_db, 'escuderia': '?', 'color_escuderia_hex': '#CCCCCC' # Fallback final
-            })
-            vrapida_info_final = {
-                "codigo": vrapida_piloto_db,
-                "tiempo_vr": vrapida_tiempo_db,
-                "nombre_completo": vrapida_piloto_detalle_final['nombre_completo'],
-                "escuderia": vrapida_piloto_detalle_final['escuderia'],
-                "color_escuderia_hex": vrapida_piloto_detalle_final['color_escuderia_hex']
-            }
-
-            # 8. Crear respuesta final combinada
-            resultado_json_respuesta = {
-                "id_carrera": id_carrera,
-                "status": "finalizada",
-                "posiciones_detalle": resultado_final_posiciones,
-                "vrapida_detalle": vrapida_info_final
-            }
-            cur.close(); conn.close()
-            return jsonify(resultado_json_respuesta), 200 # 200 OK
-
-        except (ValueError, TypeError, KeyError) as e:
-             print(f"Error procesando resultado JSONB/Pilotos para carrera {id_carrera}: {e}")
-             cur.close(); conn.close()
-             # Devolver estado pendiente si los datos están corruptos o incompletos
-             return jsonify({ "id_carrera": id_carrera, "status": "pendiente", "error_detalle": f"Datos de resultado almacenados corruptos o incompletos: {e}" }), 200 # 200 OK
+        cur.close(); conn.close()
+        return jsonify(respuesta_final), 200
 
     except psycopg2.DatabaseError as db_error:
         print(f"Error DB en obtener_resultado_carrera: {db_error}")
         if conn: conn.close()
-        return jsonify({"error": "Error de base de datos al obtener el resultado"}), 500
+        return jsonify({"error": "Error de base de datos"}), 500
     except Exception as error:
         print(f"Error general en obtener_resultado_carrera: {error}")
-        import traceback
-        traceback.print_exc()
         if conn: conn.close()
-        return jsonify({"error": "Error interno al obtener el resultado de la carrera"}), 500
-# --- FIN Endpoint GET Resultado MODIFICADO ---
+        return jsonify({"error": "Error interno"}), 500
 
 # --- Endpoint PUT /api/carreras/<id_carrera>/resultado (MODIFICADO v9 - Condición 5+ miembros para trofeos GP) ---
+# --- Endpoint PUT /api/carreras/<id_carrera>/resultado (MODIFICADO v11 - Añadido trofeo Madrid) ---
 @app.route('/api/carreras/<int:id_carrera>/resultado', methods=['PUT'])
 @jwt_required()
 def actualizar_resultado_carrera(id_carrera):
@@ -3127,7 +3220,7 @@ def actualizar_resultado_carrera(id_carrera):
         vrapida_tiempo_input = resultado_detallado_input.get('vrapida_tiempo')
         if not isinstance(posiciones_detalle_input, list) or not posiciones_detalle_input or \
            not isinstance(vrapida_piloto_input, str) or not vrapida_piloto_input or \
-           not isinstance(vrapida_tiempo_input, str): # vrapida_tiempo puede ser string vacío
+           not isinstance(vrapida_tiempo_input, str): 
             raise ValueError("Faltan campos clave (posiciones_detalle, vrapida_piloto, vrapida_tiempo) o tipo incorrecto.")
 
         posiciones_resultado_codigos = []
@@ -3140,10 +3233,23 @@ def actualizar_resultado_carrera(id_carrera):
     except (ValueError, KeyError, TypeError) as e:
         return jsonify({"error": f"Datos de resultado inválidos: {e}"}), 400
 
-    conn = None # Declarar conn aquí para usarlo en finally
+    conn = None 
     total_puntuaciones_calculadas = 0
-    # Mapas trofeos
-    map_carrera_trofeo = { 'Australia': 'GANA_AUSTRALIA', 'China': 'GANA_CHINA', 'Japan': 'GANA_JAPON', 'Bahrein': 'GANA_BAREIN', 'Saudi Arabia': 'GANA_ARABIA_SAUDI', 'Miami': 'GANA_MIAMI', 'Emilia-Romagna': 'GANA_EMILIA_ROMANA', 'Monaco': 'GANA_MONACO', 'Spain': 'GANA_ESPANA', 'Canada': 'GANA_CANADA', 'Austria': 'GANA_AUSTRIA', 'Great Bretain': 'GANA_GRAN_BRETANA', 'Belgium': 'GANA_BELGICA', 'Hungary': 'GANA_HUNGRIA', 'Netherlands': 'GANA_PAISES_BAJOS', 'Italy': 'GANA_ITALIA', 'Azerbaijan': 'GANA_AZERBAYAN', 'Singapore': 'GANA_SINGAPUR', 'United States': 'GANA_ESTADOS_UNIDOS', 'Mexico': 'GANA_MEXICO', 'Brazil': 'GANA_BRASIL', 'Las Vegas': 'GANA_LAS_VEGAS', 'Qatar': 'GANA_CATAR', 'Abu Dhabi': 'GANA_ABU_DABI' }
+    
+    # --- ACTUALIZACIÓN AQUÍ: Añadido 'Madrid': 'GANA_MADRID' al mapa ---
+    map_carrera_trofeo = { 
+        'Australia': 'GANA_AUSTRALIA', 'China': 'GANA_CHINA', 'Japan': 'GANA_JAPON', 
+        'Bahrein': 'GANA_BAREIN', 'Saudi Arabia': 'GANA_ARABIA_SAUDI', 'Miami': 'GANA_MIAMI', 
+        'Emilia-Romagna': 'GANA_EMILIA_ROMANA', 'Monaco': 'GANA_MONACO', 'Spain': 'GANA_ESPANA', 
+        'Canada': 'GANA_CANADA', 'Austria': 'GANA_AUSTRIA', 'Great Bretain': 'GANA_GRAN_BRETANA', 
+        'Belgium': 'GANA_BELGICA', 'Hungary': 'GANA_HUNGRIA', 'Netherlands': 'GANA_PAISES_BAJOS', 
+        'Italy': 'GANA_ITALIA', 'Azerbaijan': 'GANA_AZERBAYAN', 'Singapore': 'GANA_SINGAPUR', 
+        'United States': 'GANA_ESTADOS_UNIDOS', 'Mexico': 'GANA_MEXICO', 'Brazil': 'GANA_BRASIL', 
+        'Las Vegas': 'GANA_LAS_VEGAS', 'Qatar': 'GANA_CATAR', 'Abu Dhabi': 'GANA_ABU_DABI',
+        'Barcelona': 'GANA_ESPANA', # Mapeamos Barcelona al trofeo de España existente
+        'Madrid': 'GANA_MADRID'     # Nuevo mapeo para Madrid
+    }
+    
     map_piloto_trofeo = { 'VER': 'ACIERTA_VER', 'LEC': 'ACIERTA_LEC', 'ALO': 'ACIERTA_ALO', 'SAI': 'ACIERTA_SAI', 'HAM': 'ACIERTA_HAM', 'RUS': 'ACIERTA_RUS', 'NOR': 'ACIERTA_NOR' }
 
     try:
@@ -3162,7 +3268,7 @@ def actualizar_resultado_carrera(id_carrera):
         if not carrera_info_row:
              cur.close(); conn.close(); return jsonify({"error": f"Carrera con id {id_carrera} no encontrada"}), 404
         ano_carrera = carrera_info_row['ano']
-        desc_carrera = carrera_info_row['desc_carrera'] # Nombre de la carrera actual
+        desc_carrera = carrera_info_row['desc_carrera'] 
 
         # Validación contra Pilotos Activos
         active_drivers_for_race = set(); expected_driver_count_for_race = 0
@@ -3171,14 +3277,14 @@ def actualizar_resultado_carrera(id_carrera):
         pilotos_activos_db = cur.fetchall()
         if pilotos_activos_db:
             active_drivers_for_race = {p['codigo_piloto'] for p in pilotos_activos_db}; expected_driver_count_for_race = len(active_drivers_for_race)
-        else: # Fallback a temporada
+        else: 
             sql_season_drivers = "SELECT codigo_piloto FROM piloto_temporada WHERE ano = %s;"
             cur.execute(sql_season_drivers, (ano_carrera,))
             pilotos_temporada_db = cur.fetchall()
             if not pilotos_temporada_db: cur.close(); conn.close(); return jsonify({"error": f"Config error: No hay pilotos definidos para temporada {ano_carrera}."}), 409
             active_drivers_for_race = {p['codigo_piloto'] for p in pilotos_temporada_db}; expected_driver_count_for_race = len(active_drivers_for_race)
 
-        # Validar resultado recibido contra pilotos activos
+        # Validar resultado recibido
         if len(posiciones_resultado_codigos) != expected_driver_count_for_race: cur.close(); conn.close(); return jsonify({"error": f"El resultado enviado tiene {len(posiciones_resultado_codigos)} pilotos, pero se esperaban {expected_driver_count_for_race} (activos para apuesta)."}), 400
         if not all(p_code in active_drivers_for_race for p_code in posiciones_resultado_codigos): invalid_codes = [p for p in posiciones_resultado_codigos if p not in active_drivers_for_race]; cur.close(); conn.close(); return jsonify({"error": f"El resultado enviado incluye pilotos inválidos o inactivos: {invalid_codes}"}), 400
         if vrapida_piloto_input not in active_drivers_for_race: cur.close(); conn.close(); return jsonify({"error": f"El piloto de VR '{vrapida_piloto_input}' es inválido o inactivo."}), 400
@@ -3193,8 +3299,6 @@ def actualizar_resultado_carrera(id_carrera):
         print(f"DEBUG: Resultado carrera {id_carrera} actualizado en tabla carrera.")
 
         # --- 2. Poblar piloto_carrera_detalle ---
-        print(f"DEBUG: Poblando piloto_carrera_detalle para carrera {id_carrera}...")
-        # Obtener detalles de piloto_temporada para poblar
         sql_pilotos_temp_details = "SELECT codigo_piloto, nombre_completo, escuderia, color_fondo_hex, color_texto_hex FROM piloto_temporada WHERE ano = %s;"
         cur.execute(sql_pilotos_temp_details, (ano_carrera,))
         pilotos_temporada_db_details = cur.fetchall()
@@ -3213,23 +3317,20 @@ def actualizar_resultado_carrera(id_carrera):
                 activo_para_apuesta = EXCLUDED.activo_para_apuesta;
         """
         valores_pilotos_detalle = []
-        pilotos_procesados = set() # Para evitar duplicar si el de VR ya estaba en posiciones
+        pilotos_procesados = set() 
 
-        # Iterar sobre los pilotos DEL RESULTADO para crear/actualizar detalles
         for piloto_res in posiciones_detalle_input:
             codigo = piloto_res.get('codigo')
             if codigo and codigo in piloto_details_map_season:
                 details = piloto_details_map_season[codigo]
-                # Insertamos marcando activo_para_apuesta = FALSE porque la carrera ya ha ocurrido
                 valores_pilotos_detalle.append((
                     id_carrera, codigo,
                     details.get('nombre_completo', codigo), details.get('escuderia', ''),
                     details.get('color_fondo_hex', '#CCCCCC'), details.get('color_texto_hex', '#000000'),
-                    False # <-- Marcar como inactivo para futuras apuestas
+                    False 
                 ))
                 pilotos_procesados.add(codigo)
 
-        # Asegurarnos de incluir al piloto de la VR si no estaba ya
         if vrapida_piloto_input not in pilotos_procesados and vrapida_piloto_input in piloto_details_map_season:
              details = piloto_details_map_season[vrapida_piloto_input]
              valores_pilotos_detalle.append((
@@ -3241,9 +3342,6 @@ def actualizar_resultado_carrera(id_carrera):
 
         if valores_pilotos_detalle:
             cur.executemany(sql_upsert_piloto_detalle, valores_pilotos_detalle)
-            print(f"DEBUG: Upserted {cur.rowcount} registros en piloto_carrera_detalle.")
-        else:
-            print(f"WARN: No se generaron valores para piloto_carrera_detalle.")
 
         # --- 3. Buscar la SIGUIENTE carrera ---
         next_race_id = None
@@ -3257,13 +3355,9 @@ def actualizar_resultado_carrera(id_carrera):
         if next_race_row:
             next_race_id = next_race_row['id_carrera']
             next_race_name = next_race_row['desc_carrera']
-            print(f"DEBUG: Próxima carrera encontrada: ID={next_race_id}, Nombre='{next_race_name}'")
-        else:
-            print(f"DEBUG: No se encontró próxima carrera para año {ano_carrera} después de ID {id_carrera}.")
 
-        # --- 4. Bucle Principal Cálculo Puntuaciones, Trofeos, Notificaciones ---
+        # --- 4. Bucle Principal Cálculo Puntuaciones ---
         resultado_para_calculo = {"posiciones": posiciones_resultado_codigos, "vrapida": vrapida_piloto_input}
-        # Obtener porras del año, incluyendo TIPO PORRA y MEMBER_COUNT
         sql_get_porras = """
             SELECT p.id_porra, p.tipo_porra, COUNT(pa.id_usuario) as member_count
             FROM porra p
@@ -3276,7 +3370,7 @@ def actualizar_resultado_carrera(id_carrera):
 
         if not porras_del_ano:
             conn.commit(); cur.close(); conn.close()
-            return jsonify({ "mensaje": f"Resultado y detalles carrera {id_carrera} actualizados. No se encontraron porras activas.", "puntuaciones_calculadas": 0 }), 200
+            return jsonify({ "mensaje": f"Resultado guardado. No hay porras activas.", "puntuaciones_calculadas": 0 }), 200
 
         posiciones_resultado_map = {piloto: index for index, piloto in enumerate(posiciones_resultado_codigos)}
         users_notified_about_result = set()
@@ -3285,10 +3379,9 @@ def actualizar_resultado_carrera(id_carrera):
         for porra_row in porras_del_ano:
             id_porra_actual = porra_row['id_porra']
             tipo_porra_actual = porra_row['tipo_porra']
-            member_count_porra = porra_row['member_count'] # <-- Contiene el número de miembros activos
-            print(f"\nDEBUG: Procesando porra {id_porra_actual} (Tipo: {tipo_porra_actual}, Miembros: {member_count_porra}) para carrera {id_carrera}...")
+            member_count_porra = porra_row['member_count']
+            print(f"DEBUG: Procesando porra {id_porra_actual}...")
 
-            # --- Obtener SOLO apuestas ACEPTADAS ---
             sql_select_apuestas = """
                 SELECT id_usuario, posiciones, vrapida
                 FROM apuesta
@@ -3305,29 +3398,27 @@ def actualizar_resultado_carrera(id_carrera):
                      apuesta_pos_list = []
                      if isinstance(pos_data, str): apuesta_pos_list = json.loads(pos_data)
                      elif isinstance(pos_data, list): apuesta_pos_list = pos_data
-                     else: raise TypeError("Tipo inesperado apuesta['posiciones']")
-
+                     
                      if len(apuesta_pos_list) == expected_driver_count_for_race:
                          apuesta_dict = { 'id_usuario': apuesta_raw['id_usuario'], 'posiciones': apuesta_pos_list, 'vrapida': apuesta_raw['vrapida'] }
                          lista_apuestas_para_calculo.append(apuesta_dict)
                          map_apuestas_usuario[apuesta_raw['id_usuario']] = apuesta_dict
-                     else: print(f"WARN [PUT Result]: Apuesta aceptada user {apuesta_raw['id_usuario']} en porra {id_porra_actual} omitida (longitud {len(apuesta_pos_list)} != {expected_driver_count_for_race}).")
-                 except (json.JSONDecodeError, TypeError, KeyError) as e_parse: print(f"Error procesando apuesta aceptada user {apuesta_raw.get('id_usuario')} en porra {id_porra_actual}: {e_parse}")
+                 except Exception: pass
 
             puntuaciones_calculadas = []
             if lista_apuestas_para_calculo:
                 puntuaciones_calculadas = calcular_puntuaciones_api(resultado_para_calculo, lista_apuestas_para_calculo)
-            print(f"DEBUG: Puntuaciones calculadas porra {id_porra_actual}: {len(puntuaciones_calculadas)} regs.")
 
-            sql_delete_puntuaciones = "DELETE FROM puntuacion WHERE id_porra = %s AND id_carrera = %s;"
-            cur.execute(sql_delete_puntuaciones, (id_porra_actual, id_carrera))
+            # --- CAMBIO IMPORTANTE: NO BORRAMOS, HACEMOS UPSERT ---
+            # sql_delete_puntuaciones = "DELETE FROM puntuacion WHERE id_porra = %s AND id_carrera = %s;"
+            # cur.execute(sql_delete_puntuaciones, (id_porra_actual, id_carrera))
 
             participants_to_notify_result = set()
             participants_to_notify_next_race = set()
 
             if puntuaciones_calculadas:
                  puntuaciones_calculadas.sort(key=lambda x: x.get('puntos', 0), reverse=True)
-                 valores_insert_puntuaciones = []
+                 valores_upsert_puntuaciones = []
                  current_rank = 0; last_score = -1; rank_counter = 0
                  map_rank_usuario = {}
 
@@ -3335,37 +3426,38 @@ def actualizar_resultado_carrera(id_carrera):
                      rank_counter += 1
                      user_id = p['id_usuario']
                      if p['puntos'] != last_score: current_rank = rank_counter; last_score = p['puntos']
-                     valores_insert_puntuaciones.append((id_porra_actual, id_carrera, user_id, p['puntos'], ano_carrera))
+                     
+                     # Preparamos valores para UPSERT
+                     valores_upsert_puntuaciones.append((id_porra_actual, id_carrera, user_id, p['puntos'], ano_carrera))
+                     
                      map_rank_usuario[user_id] = current_rank
                      if user_id not in users_notified_about_result: participants_to_notify_result.add(user_id)
                      if next_race_id is not None and user_id not in users_notified_about_next_race: participants_to_notify_next_race.add(user_id)
 
-                 sql_insert_puntuacion = "INSERT INTO puntuacion (id_porra, id_carrera, id_usuario, puntos, ano) VALUES (%s, %s, %s, %s, %s);"
-                 cur.executemany(sql_insert_puntuacion, valores_insert_puntuaciones)
-                 num_insertadas = cur.rowcount; total_puntuaciones_calculadas += num_insertadas
-                 print(f"DEBUG: Puntuaciones nuevas insertadas: {num_insertadas} filas")
+                 # UPSERT Query: Si existe, actualiza 'puntos' pero NO 'puntos_clasificacion'
+                 # Si no existe, crea con puntos_clasificacion = 0 por defecto.
+                 sql_upsert_puntuacion = """
+                    INSERT INTO puntuacion (id_porra, id_carrera, id_usuario, puntos, ano, puntos_clasificacion)
+                    VALUES (%s, %s, %s, %s, %s, 0)
+                    ON CONFLICT (id_porra, id_carrera, id_usuario)
+                    DO UPDATE SET puntos = EXCLUDED.puntos;
+                 """
+                 cur.executemany(sql_upsert_puntuacion, valores_upsert_puntuaciones)
+                 num_insertadas = cur.rowcount; total_puntuaciones_calculadas += len(valores_upsert_puntuaciones)
 
                  detalles_trofeo = {"ano": ano_carrera, "id_porra": id_porra_actual, "id_carrera": id_carrera}
                  trofeo_carrera_especifico = map_carrera_trofeo.get(desc_carrera)
 
                  for user_id, rank in map_rank_usuario.items():
-                     if rank == 1: # Usuario ha ganado la carrera (o empatado en primer puesto)
-                         # Trofeo por ganar CUALQUIER carrera (si hay >= 5 miembros)
-                         if member_count_porra >= 5: # <--- CONDICIÓN YA EXISTENTE Y CORRECTA
+                     if rank == 1: 
+                         if member_count_porra >= 5:
                              _award_trophy(user_id, 'GANA_CARRERA_CUALQUIERA', conn, cur, detalles=detalles_trofeo)
-                         
-                         # Trofeo específico de la carrera (ej: GANA_AUSTRALIA)
-                         # ----> INICIO DE LA CORRECCIÓN <----
-                         if trofeo_carrera_especifico and member_count_porra >= 5: # <--- AÑADIR CONDICIÓN DE MIEMBROS
-                         # ----> FIN DE LA CORRECCIÓN <----
+                         if trofeo_carrera_especifico and member_count_porra >= 5:
                              _award_trophy(user_id, trofeo_carrera_especifico, conn, cur, detalles=detalles_trofeo)
-                         
-                         # Trofeo por ganar en porra pública (NO requiere 5+ miembros según descripción)
                          if tipo_porra_actual == 'PUBLICA':
                              _award_trophy(user_id, 'GANA_CARRERA_PUBLICA', conn, cur, detalles=detalles_trofeo)
 
-                     # Trofeos por acertar piloto (si hay >= 5 miembros)
-                     if member_count_porra >= 5: # <--- CONDICIÓN YA EXISTENTE Y CORRECTA PARA ESTE BLOQUE
+                     if member_count_porra >= 5:
                          apuesta_usuario = map_apuestas_usuario.get(user_id)
                          if apuesta_usuario:
                              apuesta_pos_list = apuesta_usuario.get('posiciones', [])
@@ -3377,7 +3469,7 @@ def actualizar_resultado_carrera(id_carrera):
                                       detalles_piloto = {**detalles_trofeo, "piloto": piloto_code}
                                       _award_trophy(user_id, trofeo_code, conn, cur, detalles=detalles_piloto)
             else:
-                 print(f"DEBUG: No se calcularon/insertaron puntuaciones para porra {id_porra_actual}. Obteniendo participantes para notificación.")
+                 # Si no hay puntuaciones, igual notificamos
                  cur.execute("SELECT id_usuario FROM participacion WHERE id_porra = %s AND estado IN ('CREADOR', 'ACEPTADA');", (id_porra_actual,))
                  all_participants = cur.fetchall()
                  for participant in all_participants:
@@ -3385,60 +3477,34 @@ def actualizar_resultado_carrera(id_carrera):
                      if user_id not in users_notified_about_result: participants_to_notify_result.add(user_id)
                      if next_race_id is not None and user_id not in users_notified_about_next_race: participants_to_notify_next_race.add(user_id)
 
-            # --- Notificación Resultado Listo ---
+            # --- Notificaciones (igual que antes) ---
             if participants_to_notify_result:
-                 user_ids_to_notify_list_res = list(participants_to_notify_result)
-                 placeholders_res = ','.join(['%s'] * len(user_ids_to_notify_list_res))
-                 sql_get_tokens_res = f"""
-                    SELECT id_usuario, fcm_token, language_code
-                    FROM usuario
-                    WHERE id_usuario IN ({placeholders_res})
-                      AND fcm_token IS NOT NULL AND fcm_token != '';
-                """
-                 cur.execute(sql_get_tokens_res, tuple(user_ids_to_notify_list_res))
-                 tokens_to_send_res = cur.fetchall()
-                 if tokens_to_send_res:
-                    global thread_pool_executor
-                    if thread_pool_executor is None: print("!!!!!!!! ERROR CRÍTICO [Notif Resultado]: ThreadPoolExecutor no inicializado !!!!!!!!!!")
-                    else:
-                        submitted_count_res = 0
-                        for token_row in tokens_to_send_res:
-                            user_id = token_row['id_usuario']; token = token_row['fcm_token']
-                            user_lang = (token_row.get('language_code') or 'es').strip().lower()
+                 user_ids_list = list(participants_to_notify_result)
+                 if user_ids_list:
+                     placeholders = ','.join(['%s'] * len(user_ids_list))
+                     sql_tokens = f"SELECT id_usuario, fcm_token, language_code FROM usuario WHERE id_usuario IN ({placeholders}) AND fcm_token IS NOT NULL AND fcm_token != '';"
+                     cur.execute(sql_tokens, tuple(user_ids_list))
+                     tokens = cur.fetchall()
+                     if tokens and thread_pool_executor:
+                        for t in tokens:
                             try:
-                                thread_pool_executor.submit(send_fcm_result_notification_task, user_id, token, desc_carrera, id_porra_actual, user_lang)
-                                users_notified_about_result.add(user_id); submitted_count_res += 1
-                            except Exception as submit_err: print(f"!!!!!!!! ERROR [Notif Resultado]: Fallo al hacer submit para user {user_id}. Error: {submit_err} !!!!!!!!!!")
-                        print(f"DEBUG: Enviadas {submitted_count_res} tareas de notificación de resultado al executor para porra {id_porra_actual}.")
-                 else: print(f"DEBUG: No se encontraron tokens FCM válidos para notificar resultado en porra {id_porra_actual}.")
+                                thread_pool_executor.submit(send_fcm_result_notification_task, t['id_usuario'], t['fcm_token'], desc_carrera, id_porra_actual, (t.get('language_code') or 'es').strip().lower())
+                                users_notified_about_result.add(t['id_usuario'])
+                            except: pass
 
-            # --- Notificación Próxima Carrera Disponible ---
             if next_race_id is not None and participants_to_notify_next_race:
-                print(f"DEBUG: Preparando notificación 'Next Race Available' para carrera '{next_race_name}' (ID: {next_race_id}).")
-                user_ids_to_notify_list_next = list(participants_to_notify_next_race)
-                placeholders_next = ','.join(['%s'] * len(user_ids_to_notify_list_next))
-                sql_get_tokens_next = f"""
-                    SELECT id_usuario, fcm_token, language_code
-                    FROM usuario
-                    WHERE id_usuario IN ({placeholders_next})
-                      AND fcm_token IS NOT NULL AND fcm_token != '';
-                """
-                cur.execute(sql_get_tokens_next, tuple(user_ids_to_notify_list_next))
-                tokens_to_send_next = cur.fetchall()
-                if tokens_to_send_next:
-                    if thread_pool_executor is None: print("!!!!!!!! ERROR CRÍTICO [Notif Next Race]: ThreadPoolExecutor no inicializado !!!!!!!!!!")
-                    else:
-                        submitted_count_next = 0
-                        for token_row in tokens_to_send_next:
-                            user_id = token_row['id_usuario']; token = token_row['fcm_token']
-                            user_lang = (token_row.get('language_code') or 'es').strip().lower()
+                user_ids_list = list(participants_to_notify_next_race)
+                if user_ids_list:
+                    placeholders = ','.join(['%s'] * len(user_ids_list))
+                    sql_tokens = f"SELECT id_usuario, fcm_token, language_code FROM usuario WHERE id_usuario IN ({placeholders}) AND fcm_token IS NOT NULL AND fcm_token != '';"
+                    cur.execute(sql_tokens, tuple(user_ids_list))
+                    tokens = cur.fetchall()
+                    if tokens and thread_pool_executor:
+                        for t in tokens:
                             try:
-                                thread_pool_executor.submit( send_fcm_next_race_notification_task, user_id, token, desc_carrera, next_race_name, id_porra_actual, next_race_id, user_lang )
-                                users_notified_about_next_race.add(user_id)
-                                submitted_count_next += 1
-                            except Exception as submit_err: print(f"!!!!!!!! ERROR [Notif Next Race]: Fallo al hacer submit para user {user_id}. Error: {submit_err} !!!!!!!!!!")
-                        print(f"DEBUG: Enviadas {submitted_count_next} tareas de notificación 'Next Race Available' al executor para porra {id_porra_actual}.")
-                else: print(f"DEBUG: No se encontraron tokens FCM válidos para notificar 'Next Race Available' en porra {id_porra_actual}.")
+                                thread_pool_executor.submit( send_fcm_next_race_notification_task, t['id_usuario'], t['fcm_token'], desc_carrera, next_race_name, id_porra_actual, next_race_id, (t.get('language_code') or 'es').strip().lower() )
+                                users_notified_about_next_race.add(t['id_usuario'])
+                            except: pass
         # --- Fin bucle porras ---
 
         # --- 5. Comprobar fin temporada ---
@@ -3446,17 +3512,14 @@ def actualizar_resultado_carrera(id_carrera):
         total_races_year = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM carrera WHERE ano = %s AND resultado_detallado IS NOT NULL;", (ano_carrera,))
         finished_races_year = cur.fetchone()[0]
-        is_season_finished = (total_races_year > 0 and finished_races_year >= total_races_year)
-
-        if is_season_finished:
-             print(f"INFO: Temporada {ano_carrera} finalizada. Comprobando trofeos de temporada...")
+        
+        if total_races_year > 0 and finished_races_year >= total_races_year:
              for porra_row in porras_del_ano:
                  id_porra_actual = porra_row['id_porra']
                  tipo_porra_actual = porra_row['tipo_porra']
-                 member_count_porra = porra_row['member_count'] # <-- Re-acceder al recuento de miembros
+                 member_count_porra = porra_row['member_count']
                  detalles_temporada = {"ano": ano_carrera, "id_porra": id_porra_actual}
 
-                 # Trofeo Campeón Temporada
                  sql_clasificacion = "SELECT id_usuario, SUM(puntos) as total_puntos FROM puntuacion WHERE id_porra = %s AND ano = %s GROUP BY id_usuario ORDER BY total_puntos DESC;"
                  cur.execute(sql_clasificacion, (id_porra_actual, ano_carrera))
                  clasificacion_final = cur.fetchall()
@@ -3467,93 +3530,73 @@ def actualizar_resultado_carrera(id_carrera):
                          if clasif_row['total_puntos'] == winner_score:
                             winner_user_id = clasif_row['id_usuario']
                             if winner_user_id not in processed_winners:
-                                # Trofeo campeón estándar (si >= 5 miembros)
-                                if member_count_porra >= 5: # <--- CONDICIÓN YA EXISTENTE Y CORRECTA
+                                if member_count_porra >= 5:
                                     _award_trophy(winner_user_id, 'CAMPEON_TEMPORADA', conn, cur, detalles=detalles_temporada)
-                                # Trofeo campeón público (NO requiere 5+ miembros según descripción)
                                 if tipo_porra_actual == 'PUBLICA':
                                     _award_trophy(winner_user_id, 'CAMPEON_TEMPORADA_PUBLICA', conn, cur, detalles=detalles_temporada)
                                 processed_winners.add(winner_user_id)
                          else: break 
 
-                 # Trofeo Aplicado (participar en todas las carreras - NO requiere 5+ miembros)
                  cur.execute("SELECT id_usuario FROM participacion WHERE id_porra = %s AND estado IN ('CREADOR', 'ACEPTADA');", (id_porra_actual,))
                  participantes = cur.fetchall()
                  for participante in participantes:
                      user_id_part = participante['id_usuario']
                      sql_count_bets = "SELECT COUNT(DISTINCT a.id_carrera) FROM apuesta a JOIN carrera c ON a.id_carrera = c.id_carrera WHERE a.id_usuario = %s AND a.id_porra = %s AND c.ano = %s AND a.estado_apuesta = 'ACEPTADA';"
                      cur.execute(sql_count_bets, (user_id_part, id_porra_actual, ano_carrera))
-                     bets_count_user = cur.fetchone()[0]
-                     if bets_count_user >= total_races_year:
+                     if cur.fetchone()[0] >= total_races_year:
                          _award_trophy(user_id_part, 'APLICADO', conn, cur, detalles=detalles_temporada)
-        # --- Fin comprobación fin temporada ---
 
         conn.commit()
         cur.close()
-        return jsonify({"mensaje": f"Resultado detallado y detalles piloto carrera {id_carrera} guardados.", "puntuaciones_calculadas_totales": total_puntuaciones_calculadas, "fin_temporada_comprobado": is_season_finished}), 200
+        return jsonify({"mensaje": f"Resultado detallado guardado. Puntuaciones upserted.", "puntuaciones_actualizadas": total_puntuaciones_calculadas}), 200
 
     except (Exception, psycopg2.DatabaseError) as error:
-        print(f"ERROR DETALLADO en actualizar_resultado_carrera:")
+        print(f"ERROR DETALLADO en actualizar_resultado_carrera: {error}")
         import traceback; traceback.print_exc()
         if conn: conn.rollback()
-        return jsonify({"error": "Error interno al actualizar resultado/calcular puntos"}), 500
+        return jsonify({"error": "Error interno al actualizar resultado"}), 500
     finally:
-        if conn is not None and not conn.closed:
-             conn.close()
-# --- FIN Endpoint PUT Resultado MODIFICADO ---
+        if conn is not None and not conn.closed: conn.close()
 
 
 # --- NUEVO Endpoint para OBTENER las puntuaciones de una carrera específica ---
-# --- Endpoint GET /api/porras/<id_porra>/carreras/<id_carrera>/puntuaciones (MODIFICADO con Paginación y Datos Usuario) ---
+# --- Endpoint GET /api/porras/<id_porra>/carreras/<id_carrera>/puntuaciones (MODIFICADO v2 con desglose) ---
 @app.route('/api/porras/<int:id_porra>/carreras/<int:id_carrera>/puntuaciones', methods=['GET'])
 @jwt_required()
 def obtener_puntuaciones_porra_carrera(id_porra, id_carrera):
     id_usuario_actual_str = get_jwt_identity()
-    try:
-        id_usuario_actual = int(id_usuario_actual_str)
-    except (ValueError, TypeError):
-        return jsonify({"error": "Token de usuario inválido"}), 400
+    try: id_usuario_actual = int(id_usuario_actual_str)
+    except: return jsonify({"error": "Token inválido"}), 400
 
-    # --- Paginación ---
-    try:
-        page = int(request.args.get('page', 1))
-        page_size = int(request.args.get('page_size', 25))
-        if page < 1: page = 1
-        if page_size < 1: page_size = 25
-        if page_size > 100: page_size = 100
-        offset = (page - 1) * page_size
-    except ValueError:
-        return jsonify({"error": "Parámetros 'page' y 'page_size' deben ser números enteros"}), 400
-    # --- Fin Paginación ---
+    page = int(request.args.get('page', 1))
+    page_size = int(request.args.get('page_size', 25))
+    offset = (page - 1) * page_size
 
     conn = None
     try:
         conn = psycopg2.connect(host=DB_HOST,port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-        # --- 1. Verificar Autorización (¿Usuario es miembro activo?) ---
-        sql_check_membership = """
-            SELECT 1 FROM participacion
-            WHERE id_porra = %s AND id_usuario = %s AND estado IN ('CREADOR', 'ACEPTADA');
-        """
-        cur.execute(sql_check_membership, (id_porra, id_usuario_actual))
-        if cur.fetchone() is None:
-             return jsonify({"error": "No eres miembro activo de esta porra"}), 403
+        sql_check = "SELECT 1 FROM participacion WHERE id_porra = %s AND id_usuario = %s AND estado IN ('CREADOR', 'ACEPTADA');"
+        cur.execute(sql_check, (id_porra, id_usuario_actual))
+        if cur.fetchone() is None: return jsonify({"error": "No eres miembro activo"}), 403
 
-        # --- 2. Obtener Puntuaciones PAGINADAS ---
+        # CONSULTA MODIFICADA: Desglosamos puntos_clasificacion y puntos (carrera)
         sql_get_scores_page = f"""
             WITH RankedRaceScores AS (
                 SELECT
                     u.id_usuario,
                     u.nombre,
-                    COALESCE(p.puntos, 0) as puntos, -- Puntos de esta carrera específica
-                    RANK() OVER (ORDER BY COALESCE(p.puntos, 0) DESC, u.nombre ASC) as posicion
+                    COALESCE(p.puntos_clasificacion, 0) as pts_qualy,
+                    COALESCE(p.puntos, 0) as pts_race,
+                    (COALESCE(p.puntos_clasificacion, 0) + COALESCE(p.puntos, 0)) as pts_total,
+                    RANK() OVER (ORDER BY (COALESCE(p.puntos_clasificacion, 0) + COALESCE(p.puntos, 0)) DESC, u.nombre ASC) as posicion
                 FROM usuario u
                 JOIN participacion pa ON u.id_usuario = pa.id_usuario AND pa.id_porra = %s AND pa.estado IN ('CREADOR', 'ACEPTADA')
                 LEFT JOIN puntuacion p ON u.id_usuario = p.id_usuario AND p.id_porra = %s AND p.id_carrera = %s
-                WHERE pa.id_porra = %s -- Asegura que solo contamos participantes activos
+                WHERE pa.id_porra = %s
             )
-            SELECT id_usuario, nombre, puntos, posicion
+            SELECT id_usuario, nombre, pts_qualy, pts_race, pts_total, posicion
             FROM RankedRaceScores
             ORDER BY posicion ASC
             LIMIT %s OFFSET %s;
@@ -3561,74 +3604,72 @@ def obtener_puntuaciones_porra_carrera(id_porra, id_carrera):
         cur.execute(sql_get_scores_page, (id_porra, id_porra, id_carrera, id_porra, page_size, offset))
         puntuaciones_pagina = cur.fetchall()
 
-        # --- 3. Obtener Total de Items (participantes activos en la porra) ---
-        sql_count_total = """
-             SELECT COUNT(DISTINCT u.id_usuario)
-             FROM usuario u
-             JOIN participacion pa ON u.id_usuario = pa.id_usuario
-             WHERE pa.id_porra = %s AND pa.estado IN ('CREADOR', 'ACEPTADA');
-        """
-        cur.execute(sql_count_total, (id_porra,))
+        sql_count = "SELECT COUNT(DISTINCT u.id_usuario) FROM usuario u JOIN participacion pa ON u.id_usuario = pa.id_usuario WHERE pa.id_porra = %s AND pa.estado IN ('CREADOR', 'ACEPTADA');"
+        cur.execute(sql_count, (id_porra,))
         total_items = cur.fetchone()[0]
 
-        # --- 4. Obtener Datos del Usuario Actual (Rank y Puntos para ESTA carrera) ---
-        my_rank = None
-        my_score = None
-        sql_get_user_rank_race = """
+        # Datos usuario actual
+        my_rank, my_score_total, my_score_qualy, my_score_race = None, None, None, None
+        
+        sql_my_rank = """
              WITH RankedRaceScores AS (
                  SELECT
                     u.id_usuario,
-                    COALESCE(p.puntos, 0) as puntos,
-                    RANK() OVER (ORDER BY COALESCE(p.puntos, 0) DESC, u.nombre ASC) as posicion
+                    COALESCE(p.puntos_clasificacion, 0) as pts_qualy,
+                    COALESCE(p.puntos, 0) as pts_race,
+                    (COALESCE(p.puntos_clasificacion, 0) + COALESCE(p.puntos, 0)) as pts_total,
+                    RANK() OVER (ORDER BY (COALESCE(p.puntos_clasificacion, 0) + COALESCE(p.puntos, 0)) DESC, u.nombre ASC) as posicion
                  FROM usuario u
                  JOIN participacion pa ON u.id_usuario = pa.id_usuario AND pa.id_porra = %s AND pa.estado IN ('CREADOR', 'ACEPTADA')
                  LEFT JOIN puntuacion p ON u.id_usuario = p.id_usuario AND p.id_porra = %s AND p.id_carrera = %s
-                 WHERE pa.id_porra = %s -- Asegura que solo contamos participantes activos
+                 WHERE pa.id_porra = %s
             )
-            SELECT posicion, puntos
-            FROM RankedRaceScores
-            WHERE id_usuario = %s;
+            SELECT posicion, pts_total, pts_qualy, pts_race
+            FROM RankedRaceScores WHERE id_usuario = %s;
         """
-        cur.execute(sql_get_user_rank_race, (id_porra, id_porra, id_carrera, id_porra, id_usuario_actual))
+        cur.execute(sql_my_rank, (id_porra, id_porra, id_carrera, id_porra, id_usuario_actual))
         user_rank_data = cur.fetchone()
         if user_rank_data:
             my_rank = user_rank_data['posicion']
-            my_score = user_rank_data['puntos']
+            my_score_total = user_rank_data['pts_total']
+            my_score_qualy = user_rank_data['pts_qualy']
+            my_score_race = user_rank_data['pts_race']
 
         cur.close()
 
-        # --- 5. Formatear Respuesta ---
         lista_puntuaciones_pagina = []
         for row in puntuaciones_pagina:
             lista_puntuaciones_pagina.append({
                 "posicion": row["posicion"],
                 "nombre": row["nombre"],
-                "puntos": row["puntos"],
-                "id_usuario": row["id_usuario"] # Añadir ID para identificar al usuario en Flutter
+                "puntos_total": row["pts_total"],
+                "puntos_qualy": row["pts_qualy"],
+                "puntos_race": row["pts_race"],
+                "id_usuario": row["id_usuario"]
             })
 
         return jsonify({
             "my_rank": my_rank,
-            "my_score": my_score,
+            "my_score_total": my_score_total,
+            "my_score_qualy": my_score_qualy,
+            "my_score_race": my_score_race,
             "total_items": total_items,
             "page": page,
             "page_size": page_size,
-            "items": lista_puntuaciones_pagina # Solo la página actual
-        }), 200 # 200 OK
+            "items": lista_puntuaciones_pagina
+        }), 200
 
-    except (Exception, psycopg2.DatabaseError) as error:
-        print(f"Error en obtener_puntuaciones_porra_carrera (paginado): {error}")
-        import traceback
-        traceback.print_exc()
-        if conn: conn.rollback()
-        return jsonify({"error": "Error interno al obtener las puntuaciones de la carrera"}), 500
+    except Exception as error:
+        print(f"Error obtener_puntuaciones: {error}")
+        if conn: conn.close()
+        return jsonify({"error": "Error interno"}), 500
     finally:
-        if conn is not None:
-            conn.close()
+        if conn: conn.close()
 
 
 # --- NUEVO Endpoint para OBTENER la clasificación general de un año ---
 # --- Endpoint GET /api/porras/<id_porra>/clasificacion (MODIFICADO con Paginación y Datos Usuario) ---
+# --- Endpoint GET /api/porras/<id_porra>/clasificacion (MODIFICADO con suma correcta de puntos) ---
 @app.route('/api/porras/<int:id_porra>/clasificacion', methods=['GET'])
 @jwt_required()
 def obtener_clasificacion_porra(id_porra):
@@ -3665,14 +3706,17 @@ def obtener_clasificacion_porra(id_porra):
              return jsonify({"error": "No eres miembro activo de esta porra"}), 403
 
         # --- 2. Obtener Clasificación PAGINADA ---
-        # Usamos RANK() para obtener la posición real
+        # CORRECCIÓN: Sumamos (p.puntos + p.puntos_clasificacion) manejando nulos con COALESCE
         sql_get_standings_page = f"""
             WITH RankedScores AS (
                 SELECT
                     u.id_usuario,
                     u.nombre,
-                    COALESCE(SUM(p.puntos), 0) as puntos_totales,
-                    RANK() OVER (ORDER BY COALESCE(SUM(p.puntos), 0) DESC, u.nombre ASC) as posicion
+                    COALESCE(SUM(COALESCE(p.puntos, 0) + COALESCE(p.puntos_clasificacion, 0)), 0) as puntos_totales,
+                    RANK() OVER (
+                        ORDER BY COALESCE(SUM(COALESCE(p.puntos, 0) + COALESCE(p.puntos_clasificacion, 0)), 0) DESC, 
+                        u.nombre ASC
+                    ) as posicion
                 FROM usuario u
                 LEFT JOIN participacion pa ON u.id_usuario = pa.id_usuario AND pa.id_porra = %s AND pa.estado IN ('CREADOR', 'ACEPTADA')
                 LEFT JOIN puntuacion p ON u.id_usuario = p.id_usuario AND p.id_porra = %s
@@ -3698,18 +3742,22 @@ def obtener_clasificacion_porra(id_porra):
         total_items = cur.fetchone()[0]
 
         # --- 4. Obtener Datos del Usuario Actual (Rank y Puntos) ---
+        # CORRECCIÓN: Misma lógica de suma para el usuario actual
         my_rank = None
         my_score = None
         sql_get_user_rank = """
             WITH RankedScores AS (
                  SELECT
                     u.id_usuario,
-                    COALESCE(SUM(p.puntos), 0) as puntos_totales,
-                    RANK() OVER (ORDER BY COALESCE(SUM(p.puntos), 0) DESC, u.nombre ASC) as posicion
+                    COALESCE(SUM(COALESCE(p.puntos, 0) + COALESCE(p.puntos_clasificacion, 0)), 0) as puntos_totales,
+                    RANK() OVER (
+                        ORDER BY COALESCE(SUM(COALESCE(p.puntos, 0) + COALESCE(p.puntos_clasificacion, 0)), 0) DESC, 
+                        u.nombre ASC
+                    ) as posicion
                  FROM usuario u
                  LEFT JOIN participacion pa ON u.id_usuario = pa.id_usuario AND pa.id_porra = %s AND pa.estado IN ('CREADOR', 'ACEPTADA')
                  LEFT JOIN puntuacion p ON u.id_usuario = p.id_usuario AND p.id_porra = %s
-                 WHERE pa.id_porra = %s -- Asegura que solo contamos participantes activos
+                 WHERE pa.id_porra = %s
                  GROUP BY u.id_usuario, u.nombre
             )
             SELECT posicion, puntos_totales
@@ -3731,7 +3779,7 @@ def obtener_clasificacion_porra(id_porra):
                 "posicion": row["posicion"],
                 "nombre": row["nombre"],
                 "puntos_totales": row["puntos_totales"],
-                "id_usuario": row["id_usuario"] # Añadir ID para identificar al usuario en Flutter
+                "id_usuario": row["id_usuario"] 
             })
 
         return jsonify({
@@ -3740,8 +3788,8 @@ def obtener_clasificacion_porra(id_porra):
             "total_items": total_items,
             "page": page,
             "page_size": page_size,
-            "items": lista_clasificacion_pagina # Solo la página actual
-        }), 200 # 200 OK
+            "items": lista_clasificacion_pagina 
+        }), 200 
 
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"Error en obtener_clasificacion_porra (paginado): {error}")
@@ -5260,6 +5308,7 @@ def change_password():
 
 
 # --- Endpoint GET /api/porras/<id_porra>/my-races-bet-status (MODIFICADO v2 con estado_apuesta) ---
+# --- Endpoint GET /api/porras/<id_porra>/my-races-bet-status (MODIFICADO v3 con detalle qualy/carrera) ---
 @app.route('/api/porras/<int:id_porra>/my-races-bet-status', methods=['GET'])
 @jwt_required()
 def get_my_races_with_bet_status(id_porra):
@@ -5285,12 +5334,23 @@ def get_my_races_with_bet_status(id_porra):
         if cur.fetchone() is None: 
             return jsonify({"error": "No eres miembro activo."}), 403
 
-        # --- MODIFICADO: Obtener estado_apuesta ---
+        # --- MODIFICADO: Obtener fecha carrera y desglose de apuestas (qualy vs carrera) ---
         sql_get_races_and_status = """
             SELECT
-                c.id_carrera, c.ano, c.desc_carrera, c.fecha_limite_apuesta,
-                (CASE WHEN a.id_apuesta IS NOT NULL THEN TRUE ELSE FALSE END) as has_bet,
-                a.estado_apuesta, -- <<< AÑADIDO
+                c.id_carrera, c.ano, c.desc_carrera, 
+                c.fecha_limite_apuesta, -- Límite Clasificación
+                c.fecha_limite_carrera, -- Límite Carrera (NUEVO)
+                
+                -- Check si tiene apuesta general (fila existe)
+                (CASE WHEN a.id_apuesta IS NOT NULL THEN TRUE ELSE FALSE END) as has_bet_entry,
+                
+                -- Check específico Clasificación (NUEVO)
+                (CASE WHEN a.posiciones_clasificacion IS NOT NULL THEN TRUE ELSE FALSE END) as has_bet_qualy,
+                
+                -- Check específico Carrera (NUEVO)
+                (CASE WHEN a.posiciones IS NOT NULL THEN TRUE ELSE FALSE END) as has_bet_race,
+                
+                a.estado_apuesta,
                 (CASE WHEN c.resultado_detallado IS NOT NULL THEN TRUE ELSE FALSE END) as has_results
             FROM carrera c
             LEFT JOIN apuesta a ON c.id_carrera = a.id_carrera
@@ -5303,28 +5363,36 @@ def get_my_races_with_bet_status(id_porra):
         races_with_status_raw = cur.fetchall()
         cur.close()
 
-        # Formatear fechas y devolver (incluir estado_apuesta)
+        # Formatear fechas y devolver
         lista_resultado = []
         for row_raw in races_with_status_raw:
             row = dict(row_raw)
+            # Formatear fechas a ISO string si existen
             if 'fecha_limite_apuesta' in row and isinstance(row['fecha_limite_apuesta'], datetime):
                  row['fecha_limite_apuesta'] = row['fecha_limite_apuesta'].isoformat()
+            
+            if 'fecha_limite_carrera' in row and isinstance(row['fecha_limite_carrera'], datetime):
+                 row['fecha_limite_carrera'] = row['fecha_limite_carrera'].isoformat()
+            
             row['has_results'] = bool(row.get('has_results', False))
-            # estado_apuesta puede ser None si has_bet es False, lo cual está bien
-            row['estado_apuesta'] = row.get('estado_apuesta') # <<< INCLUIDO
+            row['has_bet_entry'] = bool(row.get('has_bet_entry', False))
+            row['has_bet_qualy'] = bool(row.get('has_bet_qualy', False))
+            row['has_bet_race'] = bool(row.get('has_bet_race', False))
+            row['estado_apuesta'] = row.get('estado_apuesta')
+            
             lista_resultado.append(row)
 
         return jsonify(lista_resultado), 200
 
-    except psycopg2.DatabaseError as db_error: # Sin cambios manejo error
+    except psycopg2.DatabaseError as db_error:
         print(f"Error DB en get_my_races_with_bet_status: {db_error}")
         if conn: conn.close()
         return jsonify({"error": "Error DB obteniendo estado carreras"}), 500
-    except Exception as error: # Sin cambios manejo error
+    except Exception as error:
         print(f"ERROR DETALLADO en get_my_races_with_bet_status:"); import traceback; traceback.print_exc()
         if conn: conn.close()
         return jsonify({"error": "Error interno al obtener estado de apuestas de carreras"}), 500
-    finally: # Sin cambios finally
+    finally:
         if conn is not None and not conn.closed:
              conn.close()
 
@@ -5440,6 +5508,7 @@ def unirse_porra_publica(id_porra):
             conn.close()
 
 # --- Endpoint GET /api/porras/<id_porra>/my-bets (MODIFICADO v2 con estado_apuesta) ---
+# --- Endpoint GET /api/porras/<id_porra>/my-bets (MODIFICADO v3 con posiciones_clasificacion) ---
 @app.route('/api/porras/<int:id_porra>/my-bets', methods=['GET'])
 @jwt_required()
 def get_all_my_bets_in_porra(id_porra):
@@ -5459,12 +5528,12 @@ def get_all_my_bets_in_porra(id_porra):
         cur.execute(sql_check_membership, (id_porra, id_usuario_actual))
         if cur.fetchone() is None: return jsonify({"error": "No eres miembro activo."}), 403
 
-        # --- MODIFICADO: Obtener estado_apuesta ---
+        # --- MODIFICADO: Obtener también posiciones_clasificacion ---
         sql_get_bets = """
-            SELECT id_apuesta, id_porra, id_carrera, id_usuario, posiciones, vrapida, estado_apuesta
+            SELECT id_apuesta, id_porra, id_carrera, id_usuario, posiciones, posiciones_clasificacion, vrapida, estado_apuesta
             FROM apuesta
             WHERE id_porra = %s AND id_usuario = %s
-            ORDER BY id_carrera ASC; -- Opcional: ordenar por carrera
+            ORDER BY id_carrera ASC;
         """
         cur.execute(sql_get_bets, (id_porra, id_usuario_actual))
         my_bets = cur.fetchall()
@@ -5474,19 +5543,26 @@ def get_all_my_bets_in_porra(id_porra):
         lista_apuestas_formateada = []
         for apuesta in my_bets:
             try:
-                # Parsear JSONB (sin cambios)
+                # Parsear JSONB Carrera
                 pos_data = apuesta['posiciones']
                 posiciones_list = []
                 if isinstance(pos_data, str): posiciones_list = json.loads(pos_data)
                 elif isinstance(pos_data, list): posiciones_list = pos_data
                 elif isinstance(pos_data, dict) and all(isinstance(k, int) for k in pos_data.keys()): posiciones_list = [pos_data[k] for k in sorted(pos_data.keys())]
-                else: raise TypeError("Tipo inesperado para 'posiciones'")
+                
+                # Parsear JSONB Clasificación (NUEVO)
+                pos_class_data = apuesta['posiciones_clasificacion']
+                posiciones_class_list = []
+                if isinstance(pos_class_data, str): posiciones_class_list = json.loads(pos_class_data)
+                elif isinstance(pos_class_data, list): posiciones_class_list = pos_class_data
 
                 apuesta_formateada = {
                     "id_apuesta": apuesta["id_apuesta"], "id_porra": apuesta["id_porra"],
                     "id_carrera": apuesta["id_carrera"], "id_usuario": apuesta["id_usuario"],
-                    "posiciones": posiciones_list, "vrapida": apuesta["vrapida"],
-                    "estado_apuesta": apuesta["estado_apuesta"] # <<< AÑADIDO
+                    "posiciones": posiciones_list, 
+                    "posiciones_clasificacion": posiciones_class_list, # <<< AÑADIDO
+                    "vrapida": apuesta["vrapida"],
+                    "estado_apuesta": apuesta["estado_apuesta"]
                 }
                 lista_apuestas_formateada.append(apuesta_formateada)
             except (json.JSONDecodeError, TypeError, KeyError) as e:
@@ -5495,16 +5571,16 @@ def get_all_my_bets_in_porra(id_porra):
 
         return jsonify(lista_apuestas_formateada), 200
 
-    except psycopg2.DatabaseError as db_error: # Sin cambios manejo error
+    except psycopg2.DatabaseError as db_error:
         print(f"Error DB en get_all_my_bets_in_porra: {db_error}")
         if conn: conn.rollback()
         return jsonify({"error": "Error de base de datos al obtener mis apuestas"}), 500
-    except Exception as error: # Sin cambios manejo error
+    except Exception as error:
         print(f"Error general en get_all_my_bets_in_porra: {error}")
         import traceback; traceback.print_exc()
         if conn: conn.rollback()
         return jsonify({"error": "Error interno al obtener mis apuestas"}), 500
-    finally: # Sin cambios finally
+    finally:
         if conn is not None and not conn.closed:
             conn.close()
 
@@ -6065,6 +6141,32 @@ def update_language():
         if conn is not None:
             conn.close()
 
+# --- NUEVO Endpoint PUT /api/profile/timezone ---
+@app.route('/api/profile/timezone', methods=['PUT'])
+@jwt_required()
+def update_timezone():
+    id_usuario_actual = get_jwt_identity()
+    if not request.is_json: return jsonify({"error": "JSON requerido"}), 400
+    
+    data = request.get_json()
+    timezone_str = data.get('timezone')
+    if not timezone_str: return jsonify({"error": "Falta timezone"}), 400
+
+    conn = None
+    try:
+        conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
+        cur = conn.cursor()
+        # Guardamos la zona horaria
+        cur.execute("UPDATE usuario SET timezone = %s WHERE id_usuario = %s;", (timezone_str, id_usuario_actual))
+        conn.commit()
+        cur.close()
+        return jsonify({"mensaje": "Zona horaria actualizada."}), 200
+    except Exception as e:
+        print(f"Error update_timezone: {e}")
+        return jsonify({"error": "Error interno"}), 500
+    finally:
+        if conn: conn.close()
+
 # Token de seguridad (defínelo en tus variables de entorno o pon uno difícil aquí)
 GPT_ACTION_SECRET = os.environ.get('GPT_ACTION_SECRET', 'F1_PORRA_SECRET_KEY_2025')
 
@@ -6164,6 +6266,329 @@ def obtener_noticias():
         return jsonify({"error": str(e)}), 500
     finally:
         if conn: conn.close()
+
+@app.route('/api/carreras/<int:id_carrera>/fetch-clasificacion', methods=['POST'])
+@jwt_required()
+def fetch_clasificacion_result(id_carrera):
+    """
+    Descarga resultados de clasificación de Jolpica y calcula puntos.
+    Requiere ser Admin.
+    """
+    id_usuario = get_jwt_identity()
+    
+    conn = None
+    try:
+        conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+        # 1. Verificar Admin
+        cur.execute("SELECT es_admin FROM usuario WHERE id_usuario = %s", (id_usuario,))
+        user = cur.fetchone()
+        if not user or not user['es_admin']:
+            return jsonify({"error": "Requiere permisos de administrador"}), 403
+
+        # 2. Obtener datos carrera
+        cur.execute("SELECT ano, desc_carrera FROM carrera WHERE id_carrera = %s", (id_carrera,))
+        race = cur.fetchone()
+        if not race: return jsonify({"error": "Carrera no encontrada"}), 404
+        
+        ano = race['ano']
+        
+        # --- MEJORA DE ROBUSTEZ ---
+        # Calculamos la ronda basándonos en el ORDEN CRONOLÓGICO (fecha_limite_apuesta)
+        # en lugar del ID, para evitar errores si las carreras se insertaron desordenadas.
+        cur.execute("""
+            SELECT id_carrera 
+            FROM carrera 
+            WHERE ano = %s 
+            ORDER BY fecha_limite_apuesta ASC
+        """, (ano,))
+        rows = cur.fetchall()
+        
+        round_num = 0
+        for idx, r in enumerate(rows):
+            if r['id_carrera'] == id_carrera:
+                round_num = idx + 1
+                break
+        
+        if round_num == 0: 
+            return jsonify({"error": "No se pudo determinar la ronda cronológica de la carrera"}), 500
+
+        print(f"DEBUG: Fetching Qualifying for Year {ano}, Round {round_num}")
+
+        # 3. Llamar a Jolpica (Qualifying)
+        # Endpoint: {year}/{round}/qualifying.json
+        path = f"{ano}/{round_num}/qualifying.json"
+        try:
+            jolpica_data = _jolpica_get(path)
+        except JolpicaError as e:
+            return jsonify({"error": f"Error Jolpica: {e}"}), 502
+
+        # 4. Parsear respuesta Jolpica
+        # Estructura: MRData -> RaceTable -> Races[0] -> QualifyingResults
+        races = jolpica_data.get('MRData', {}).get('RaceTable', {}).get('Races', [])
+        if not races:
+            return jsonify({"error": "Jolpica no devolvió datos de carrera para esa ronda"}), 404
+        
+        qualy_results = races[0].get('QualifyingResults', [])
+        if not qualy_results:
+            return jsonify({"error": "Resultados de clasificación no disponibles aún en Jolpica"}), 404
+
+        # Construir array de posiciones (códigos) y detalle
+        posiciones_clasificacion_codes = []
+        resultado_detallado_q = []
+
+        for item in qualy_results:
+            driver = item.get('Driver', {})
+            code = driver.get('code') or driver.get('driverId') # Fallback
+            # Normalizar código (ej: 'VER', 'HAM')
+            if code:
+                code = code.upper()[0:3]
+                posiciones_clasificacion_codes.append(code)
+            
+            # Guardar tiempos
+            resultado_detallado_q.append({
+                "posicion": item.get('position'),
+                "codigo": code,
+                "q1": item.get('Q1', ''),
+                "q2": item.get('Q2', ''),
+                "q3": item.get('Q3', '')
+            })
+
+        if not posiciones_clasificacion_codes:
+             return jsonify({"error": "Error parseando datos de pilotos"}), 500
+
+        # 5. Guardar en BD (Tabla Carrera)
+        sql_update_carrera = """
+            UPDATE carrera 
+            SET posiciones_clasificacion = %s::jsonb,
+                resultado_detallado_clasificacion = %s::jsonb
+            WHERE id_carrera = %s
+        """
+        cur.execute(sql_update_carrera, (
+            json.dumps(posiciones_clasificacion_codes),
+            json.dumps(resultado_detallado_q),
+            id_carrera
+        ))
+
+        # 6. CALCULAR PUNTOS AUTOMÁTICAMENTE
+        # Obtener reglas Q (cuántos eliminados en Q1/Q2)
+        q_rules = _get_q_rules(ano, cur)
+        
+        # Obtener apuestas de clasificación ACEPTADAS para esta carrera
+        cur.execute("""
+            SELECT id_usuario, posiciones_clasificacion 
+            FROM apuesta 
+            WHERE id_carrera = %s AND estado_apuesta = 'ACEPTADA' AND posiciones_clasificacion IS NOT NULL
+        """, (id_carrera,))
+        apuestas = cur.fetchall()
+
+        updates_puntuacion = 0
+        for ap in apuestas:
+            u_id = ap['id_usuario']
+            u_pos = ap['posiciones_clasificacion'] # Es jsonb, psycopg2 lo convierte a list/dict
+            
+            # Calcular usando la lógica de negocio existente
+            pts = _calculate_qualifying_points(u_pos, posiciones_clasificacion_codes, q_rules)
+            
+            # Actualizar Puntuacion (Solo columna puntos_clasificacion)
+            # Usamos ON CONFLICT para crear la fila si no existe (por si el usuario no apostó a la carrera pero sí a la qualy, caso raro pero posible)
+            sql_upsert_pts = """
+                INSERT INTO puntuacion (id_porra, id_carrera, id_usuario, ano, puntos_clasificacion, puntos)
+                SELECT id_porra, %s, %s, %s, %s, 0
+                FROM apuesta WHERE id_carrera=%s AND id_usuario=%s
+                ON CONFLICT (id_porra, id_carrera, id_usuario) 
+                DO UPDATE SET puntos_clasificacion = EXCLUDED.puntos_clasificacion;
+            """
+            cur.execute(sql_upsert_pts, (id_carrera, u_id, ano, pts, id_carrera, u_id))
+            updates_puntuacion += cur.rowcount
+
+        conn.commit()
+        return jsonify({
+            "mensaje": "Resultados de clasificación actualizados y puntos calculados correctamente.",
+            "ronda_detectada": round_num,
+            "pilotos_orden": posiciones_clasificacion_codes,
+            "puntuaciones_actualizadas": updates_puntuacion
+        }), 200
+
+    except Exception as e:
+        if conn: conn.rollback()
+        print(f"Error fetch-clasificacion: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Excepción interna: {e}"}), 500
+    finally:
+        if conn: conn.close()
+
+# ==========================================
+#  INICIO: ENDPOINTS SALÓN DE LA FAMA (HALL OF FAME)
+# ==========================================
+
+@app.route('/api/hall_of_fame/champions', methods=['GET'])
+@jwt_required()
+def get_hall_of_fame_champions():
+    """
+    Obtiene los ganadores históricos de las Ligas Públicas por año.
+    Devuelve: Lista de {ano, nombre_usuario, puntos_totales}
+    Corregido: Usa la tabla 'puntuacion' sumando puntos + puntos_clasificacion.
+    """
+    conn = None
+    try:
+        conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Lógica corregida:
+        # 1. Obtenemos la suma de puntos por usuario y año en porras PÚBLICAS.
+        # 2. Usamos RANK() para ver quién quedó primero cada año.
+        query = """
+            WITH PuntosPorUsuario AS (
+                SELECT 
+                    p.ano,
+                    u.nombre as nombre_usuario,
+                    SUM(COALESCE(pu.puntos, 0) + COALESCE(pu.puntos_clasificacion, 0)) as puntos_totales
+                FROM puntuacion pu
+                JOIN porra p ON pu.id_porra = p.id_porra
+                JOIN usuario u ON pu.id_usuario = u.id_usuario
+                WHERE p.tipo_porra = 'PUBLICA'
+                GROUP BY p.ano, u.id_usuario, u.nombre
+            ),
+            RankingAnual AS (
+                SELECT 
+                    ano,
+                    nombre_usuario,
+                    puntos_totales,
+                    RANK() OVER (PARTITION BY ano ORDER BY puntos_totales DESC) as ranking
+                FROM PuntosPorUsuario
+            )
+            SELECT 
+                ano, 
+                nombre_usuario, 
+                puntos_totales 
+            FROM RankingAnual
+            WHERE ranking = 1
+            ORDER BY ano DESC;
+        """
+        cursor.execute(query)
+        champions = cursor.fetchall()
+        
+        return jsonify(champions), 200
+
+    except Exception as e:
+        print(f"Error en get_hall_of_fame_champions: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'message': 'Error al obtener campeones'}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.route('/api/hall_of_fame/global_records', methods=['GET'])
+@jwt_required()
+def get_hall_of_fame_global_records():
+    """
+    Obtiene:
+    1. Top 3 puntuaciones más altas en una sola carrera (Carrera + Clasificación) en ligas públicas.
+    2. Lista de nombres de circuitos disponibles.
+    Corregido: Elimina referencia a tabla inexistente 'participante'.
+    """
+    conn = None
+    try:
+        conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # 1. Obtener Top 3 Récords Globales
+        # Unimos puntuacion directamente con usuario, porra y carrera.
+        query_records = """
+            SELECT 
+                u.nombre as nombre_usuario,
+                c.ano,
+                c.desc_carrera as nombre_carrera,
+                (COALESCE(pt.puntos, 0) + COALESCE(pt.puntos_clasificacion, 0)) as puntos
+            FROM puntuacion pt
+            JOIN usuario u ON pt.id_usuario = u.id_usuario
+            JOIN porra p ON pt.id_porra = p.id_porra
+            JOIN carrera c ON pt.id_carrera = c.id_carrera
+            WHERE p.tipo_porra = 'PUBLICA'
+            ORDER BY (COALESCE(pt.puntos, 0) + COALESCE(pt.puntos_clasificacion, 0)) DESC
+            LIMIT 3;
+        """
+        cursor.execute(query_records)
+        top_3_global = cursor.fetchall()
+
+        # 2. Obtener Lista de Circuitos
+        query_circuits = """
+            SELECT DISTINCT desc_carrera
+            FROM carrera
+            ORDER BY desc_carrera ASC;
+        """
+        cursor.execute(query_circuits)
+        circuit_list = [item['desc_carrera'] for item in cursor.fetchall()]
+
+        return jsonify({
+            'top_3_global': top_3_global,
+            'circuitos': circuit_list
+        }), 200
+
+    except Exception as e:
+        print(f"Error en get_hall_of_fame_global_records: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'message': 'Error al obtener récords globales'}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.route('/api/hall_of_fame/circuit_records', methods=['GET'])
+@jwt_required()
+def get_hall_of_fame_circuit_records():
+    """
+    Obtiene el Top 3 histórico para un circuito específico (Carrera + Clasificación).
+    Corregido: Elimina referencia a tabla inexistente 'participante'.
+    """
+    race_name = request.args.get('race_name')
+    
+    if not race_name:
+        return jsonify({'message': 'Falta el parámetro race_name'}), 400
+
+    conn = None
+    try:
+        conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        query = """
+            SELECT 
+                u.nombre as nombre_usuario,
+                c.ano,
+                c.desc_carrera as nombre_carrera,
+                (COALESCE(pt.puntos, 0) + COALESCE(pt.puntos_clasificacion, 0)) as puntos
+            FROM puntuacion pt
+            JOIN usuario u ON pt.id_usuario = u.id_usuario
+            JOIN porra p ON pt.id_porra = p.id_porra
+            JOIN carrera c ON pt.id_carrera = c.id_carrera
+            WHERE p.tipo_porra = 'PUBLICA'
+            AND c.desc_carrera = %s
+            ORDER BY (COALESCE(pt.puntos, 0) + COALESCE(pt.puntos_clasificacion, 0)) DESC
+            LIMIT 3;
+        """
+        cursor.execute(query, (race_name,))
+        circuit_records = cursor.fetchall()
+
+        return jsonify(circuit_records), 200
+
+    except Exception as e:
+        print(f"Error en get_hall_of_fame_circuit_records: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'message': 'Error al obtener récords del circuito'}), 500
+    finally:
+        if conn:
+            conn.close()
+
+# ==========================================
+#  FIN: ENDPOINTS SALÓN DE LA FAMA
+# ==========================================
 
 # Inicializa la variable scheduler globalmente para que atexit pueda accederla
 scheduler = None
