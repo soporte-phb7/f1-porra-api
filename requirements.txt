@@ -12,9 +12,12 @@ flask_executor
 APScheduler
 curl_cffi>=0.5.10
 # ------f1 real time--------
-fastf1
 flask-socketio
 eventlet
 pandas
 requests
 Flask-Cors
+Flask-Executor
+numpy
+livef1
+werkzeug
