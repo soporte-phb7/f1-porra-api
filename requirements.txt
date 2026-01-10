@@ -21,3 +21,4 @@ Flask-Executor
 numpy
 livef1
 werkzeug
+beautifulsoup4
