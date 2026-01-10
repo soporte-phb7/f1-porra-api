@@ -1,3 +1,6 @@
+import eventlet
+eventlet.monkey_patch()
+
 from flask import Flask, jsonify, request,make_response  # Importa Flask y una función para convertir a JSON
 import psycopg2               # Importa el conector de PostgreSQL
 import psycopg2.extras        # Para obtener resultados como diccionarios (opcional pero útil)
@@ -31,6 +34,12 @@ import base64
 import urllib.parse # Para codificar el texto del prompt
 import math # Necesario para cálculos si fuera el caso, aunque usaremos lógica simple
 # Asegúrate de que 'datetime', 'timezone' y 'ZoneInfo' estén ya importados correctamente arriba.
+
+# --- NUEVOS IMPORTS ---
+from flask_cors import CORS
+from flask_socketio import SocketIO, emit
+from f1_service import F1Service
+# ----------------------
 
 # Configurar logging para ver mensajes de APScheduler (opcional pero útil)
 logging.basicConfig(level=logging.INFO)
@@ -241,6 +250,26 @@ def _parse_constructor_standings(ergast_json):
 # Crea la aplicación Flask
 app = Flask(__name__)
 
+# Permitir CORS para desarrollo local (Flutter Web o Emulador)
+CORS(app)
+
+# --- INICIALIZAR SOCKET.IO ---
+# async_mode='eventlet' es clave para Gunicorn
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+
+# Inicializar Servicio de Simulación
+race_service = F1Service(
+    socketio, 
+    db_config={
+        'host': DB_HOST,
+        'port': DB_PORT,
+        'database': DB_NAME,
+        'user': DB_USER,
+        'password': DB_PASS
+    }
+)
+# -----------------------------
+
 #mail = Mail(app) # Inicializa Flask-Mail con tu app
 # --- Configuración de Flask-JWT-Extended ---
 # Necesita una clave secreta. ¡CAMBIA ESTO por algo seguro y mantenlo secreto en producción!
@@ -280,6 +309,155 @@ thread_pool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WOR
 print(f"INFO: ThreadPoolExecutor inicializado con max_workers={MAX_WORKERS_FCM}")
 # --- FIN NUEVO ---
 
+
+# ==========================================
+#  FUNCIONALIDAD DE NOTIFICACIONES MASIVAS (MULTIDIOMA)
+# ==========================================
+
+def _send_broadcast_notification_task(notification_type, format_args, data_payload=None):
+    """
+    Envía una notificación a TODOS los usuarios con token, respetando su idioma.
+    notification_type: Clave en FCM_TEXTS (ej: 'live_race_start')
+    format_args: Diccionario para rellenar los {corchetes} (ej: {'race': 'Bahrain', 'year': '2024'})
+    """
+    print(f"📢 BROADCAST: Iniciando envío masivo multidioma: '{notification_type}'")
+    conn = None
+    try:
+        conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
+        cur = conn.cursor()
+        
+        # OBTENER TOKEN E IDIOMA
+        cur.execute("SELECT fcm_token, language_code FROM usuario WHERE fcm_token IS NOT NULL AND fcm_token != '';")
+        users = cur.fetchall()
+        cur.close()
+        
+        if not users:
+            print("📢 BROADCAST: No hay usuarios suscritos.")
+            return
+
+        count = 0
+        # Asegurar instancia de Firebase (por si corre en un hilo nuevo)
+        try:
+            app = firebase_admin.get_app()
+        except ValueError:
+            cred = credentials.Certificate(FIREBASE_CRED_PATH)
+            app = firebase_admin.initialize_app(cred, {'projectId': FIREBASE_PROJECT_ID})
+
+        for row in users:
+            token = row[0]
+            # Detectar idioma (default 'es')
+            user_lang = (row[1] or 'es').strip().lower()
+            
+            # Generar texto personalizado
+            try:
+                title, body = _fcm_text(notification_type, user_lang, **format_args)
+                
+                msg = messaging.Message(
+                    notification=messaging.Notification(title=title, body=body),
+                    data=data_payload or {},
+                    token=token
+                )
+                messaging.send(msg, app=app)
+                count += 1
+            except Exception:
+                pass # Ignorar errores individuales
+                
+        print(f"📢 BROADCAST: Enviado exitosamente a {count}/{len(users)} dispositivos.")
+        
+    except Exception as e:
+        print(f"ERROR BROADCAST: {e}")
+        import traceback; traceback.print_exc()
+    finally:
+        if conn: conn.close()
+
+def enviar_notificacion_broadcast(notification_type, format_args, extra_data=None):
+    """Wrapper para lanzar la tarea en el executor global"""
+    if thread_pool_executor:
+        thread_pool_executor.submit(_send_broadcast_notification_task, notification_type, format_args, extra_data)
+    else:
+        print("ERROR: ThreadPool no inicializado.")
+
+# ==========================================
+#  AUTOMATIZACIÓN: SCHEDULER & LIVE RACE
+# ==========================================
+
+def check_live_race_start():
+    """
+    Revisa si hay una carrera a punto de empezar (< 5 mins) para arrancar el directo automáticamente.
+    """
+    print("⏱️ SCHEDULER: Comprobando inicio de carreras...", flush=True)
+    
+    # Si ya está corriendo (Simulación o Live), no interrumpimos
+    if race_service.is_running:
+        print("⏱️ SCHEDULER: El servicio ya está en ejecución. Saltando comprobación.")
+        return
+
+    conn = None
+    try:
+        conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        
+        now = datetime.now(timezone.utc)
+        # Ventana de tiempo: desde ahora hasta dentro de 5 minutos
+        # Buscamos carreras cuya fecha_limite_carrera (inicio real) esté en este rango
+        # Y que NO hayan terminado (podríamos mirar flags en DB si existieran)
+        
+        start_window = now
+        end_window = now + timedelta(minutes=6) # Margen de 1 min extra
+        
+        # Asumimos que fecha_limite_carrera es el inicio de la carrera (Domingo)
+        sql = """
+            SELECT id_carrera, ano, desc_carrera, fecha_limite_carrera, notificar 
+            FROM carrera 
+            WHERE fecha_limite_carrera >= %s 
+              AND fecha_limite_carrera <= %s
+        """
+        cur.execute(sql, (start_window, end_window))
+        race = cur.fetchone()
+        
+        if race:
+            nombre = race['desc_carrera']
+            ano = race['ano']
+            notificar = race['notificar']
+            id_carrera = race['id_carrera']
+            
+            print(f"🚀 SCHEDULER: ¡Hora de carrera! Iniciando directo para {nombre} {ano}")
+            
+            # 1. Arrancar el servicio en modo LIVE
+            success = race_service.start_live(ano, nombre)
+
+            if success:
+                # 2. Enviar Notificación si corresponde
+                if notificar:
+                    # Usamos el sistema multidioma
+                    print(f"🚀 SCHEDULER: Enviando notificación multidioma para {nombre}")
+                    
+                    data = {
+                        "tipo_notificacion": "live_race_start",
+                        "race_id": str(id_carrera)
+                    }
+                    
+                    # Llamamos con la CLAVE y los DATOS para rellenar
+                    enviar_notificacion_broadcast(
+                        'live_race_start', 
+                        {'race': nombre, 'year': str(ano)}, 
+                        data
+                    )
+                    
+                    # 3. Marcar como notificado para no repetir
+                    cur.execute("UPDATE carrera SET notificar = FALSE WHERE id_carrera = %s", (id_carrera,))
+                    conn.commit()
+
+            else:
+                print("❌ SCHEDULER: Fallo al iniciar el servicio Live.")
+        else:
+            print("⏱️ SCHEDULER: Ninguna carrera próxima en los siguientes 5 minutos.")
+
+        cur.close()
+    except Exception as e:
+        print(f"ERROR SCHEDULER: {e}")
+    finally:
+        if conn: conn.close()
 
 # ======= i18n para notificaciones FCM =======
 SUPPORTED_LANGS = {'es','en','fr','pt','ca'}
@@ -408,6 +586,38 @@ FCM_TEXTS = {
             'pt': "Conseguiste o troféu: {trophy}.",
             'ca': "Has aconseguit el trofeu: {trophy}."
         }
+    },
+    'simulation_start': {
+        'title': {
+            'es': "🏎️ Hoy simulamos: {race} {year}",
+            'en': "🏎️ Simulating today: {race} {year}",
+            'fr': "🏎️ Simulation aujourd'hui : {race} {year}",
+            'pt': "🏎️ Simulação hoje: {race} {year}",
+            'ca': "🏎️ Avui simulem: {race} {year}"
+        },
+        'body': {
+            'es': "¡La simulación va a comenzar! Entra a verlo.",
+            'en': "The simulation is about to start! Watch it now.",
+            'fr': "La simulation va commencer ! Regarde-la maintenant.",
+            'pt': "A simulação vai começar! Entra para ver.",
+            'ca': "La simulació està a punt de començar! Entra a veure-ho."
+        }
+    },
+    'live_race_start': {
+        'title': {
+            'es': "🔴 ¡Estamos en directo!",
+            'en': "🔴 We are Live!",
+            'fr': "🔴 Nous sommes en direct !",
+            'pt': "🔴 Estamos em direto!",
+            'ca': "🔴 Estem en directe!"
+        },
+        'body': {
+            'es': "{race} {year} está comenzando. ¡Entra a verlo en vivo!",
+            'en': "{race} {year} is starting. Watch it live!",
+            'fr': "{race} {year} commence. Regardez en direct !",
+            'pt': "{race} {year} está a começar. Vê em direto!",
+            'ca': "{race} {year} està començant. Mira-ho en directe!"
+        }
     }
 }
 
@@ -415,15 +625,19 @@ def _fcm_text(kind: str, lang: str, **kwargs):
     lang = _pick_lang(lang)
     pack = FCM_TEXTS.get(kind, {})
     title_map = pack.get('title', {})
+    
     # Para bet_status_update elegimos body según status
     if kind == 'bet_status_update':
         status = kwargs.get('status', 'ACEPTADA')
         body_map = pack.get('body_accept' if status == 'ACEPTADA' else 'body_reject', {})
     else:
         body_map = pack.get('body', {})
-    title = title_map.get(lang, title_map.get('es', ''))
+        
+    title_tpl = title_map.get(lang, title_map.get('es', ''))
     body_tpl = body_map.get(lang, body_map.get('es', ''))
-    return title, body_tpl.format(**kwargs)
+    
+    # --- CORRECCIÓN: Formatear TAMBIÉN el título ---
+    return title_tpl.format(**kwargs), body_tpl.format(**kwargs)
 # ======= fin i18n =======
 
 # --- Funciones de caché en PostgreSQL para clasificaciones F1 (NUEVO) ---
@@ -6590,6 +6804,90 @@ def get_hall_of_fame_circuit_records():
 #  FIN: ENDPOINTS SALÓN DE LA FAMA
 # ==========================================
 
+# ==========================================
+#  INICIO: ENDPOINTS LIVEF1
+# ==========================================
+
+@app.route('/')
+def index():
+    return "F1 Race Server Running 🏎️"
+
+@app.route('/api/simulate/start', methods=['POST'])
+def start_simulation():
+    if not request.is_json:
+        return jsonify({"error": "JSON requerido"}), 400
+        
+    data = request.get_json()
+    race_year = data.get('year', '2023')
+    race_name = data.get('race_name', 'Bahrain')
+    speed = data.get('speed', 1.0)
+    
+    # Nuevo parámetro para notificación manual
+    should_notify = data.get('notificar', 'No') # "Si" o "No"
+
+    print(f"🏁 API: Iniciando simulación {race_name} {race_year} (Notificar: {should_notify})")
+
+    # Iniciar Simulación
+    race_service.start_simulation(race_year, race_name, speed=float(speed))
+
+    # Lógica de notificación
+    if should_notify == "Si":
+
+        print(f"🏁 API: Enviando notificación broadcast simulación multidioma...")
+        
+        data_payload = {"tipo_notificacion": "simulation_start"}
+        
+        # Llamamos con la CLAVE y los DATOS
+        enviar_notificacion_broadcast(
+            'simulation_start', 
+            {'race': race_name, 'year': str(race_year)}, 
+            data_payload
+        )
+
+    return jsonify({"message": f"Simulación iniciada: {race_name} {race_year}"}), 200
+
+@app.route('/api/simulate/stop', methods=['POST'])
+def stop_simulation():
+    race_service.stop_service()
+    return jsonify({"message": "Servicio detenido"}), 200
+
+@app.route('/api/simulate/speed', methods=['POST'])
+def set_simulation_speed():
+    """Endpoint para cambiar la velocidad en caliente"""
+    data = request.json
+    speed = data.get('speed', 1.0) # Default 1x (Tiempo Real)
+    success = race_service.set_speed(speed)
+    if success:
+        return jsonify({"status": "ok", "speed": speed})
+    else:
+        return jsonify({"status": "error", "message": "Invalid speed"}), 400
+
+@app.route('/api/live/start', methods=['POST'])
+def start_live():
+    # Llama al nuevo método del servicio
+    msg = race_service.start_live_session()
+    return jsonify({"status": msg})
+
+    # --- NUEVO: Endpoint para consultar si hay sesión activa (Simulación o Live) ---
+@app.route('/api/race/status', methods=['GET'])
+def get_race_status():
+    """
+    El frontend llamará aquí para saber si muestra el botón de 'Directo'.
+    """
+    return jsonify({
+        "is_running": race_service.is_running,
+        "mode": race_service.mode, # 'SIMULATION' o 'LIVE'
+        "race_name": race_service.race_name,
+        "race_year": race_service.race_year,
+        "lap": race_service.current_lap_display,
+        "total_laps": race_service.total_laps
+    }), 200
+
+# ==========================================
+#  FIN: ENDPOINTS LIVEF1
+# ==========================================
+
+
 # Inicializa la variable scheduler globalmente para que atexit pueda accederla
 scheduler = None
 
@@ -6626,6 +6924,15 @@ if os.environ.get('RUN_SCHEDULER', 'false').lower() == 'true':
             trigger=IntervalTrigger(hours=12),  # Ajusta si quieres más/menos frecuencia
             id='f1_standings_sync_job',
             name='Sync F1 standings (drivers & constructors) from Jolpica',
+            replace_existing=True
+        )
+
+
+        scheduler.add_job(
+            func=check_live_race_start,
+            trigger=IntervalTrigger(minutes=1), # O tu intervalo deseado
+            id='live_race_check',
+            name='Check live race to broadcast',
             replace_existing=True
         )
 
@@ -6674,6 +6981,9 @@ if 'atexit' in globals(): # Comprobar si atexit fue importado
 
 # ... (el resto de tus endpoints y la lógica de la API) ...
 
-# if __name__ == '__main__':
-#     # Considera usar use_reloader=False si el scheduler se inicia aquí y tienes problemas
-#     app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000), debug=False, use_reloader=False)
+# --- MODIFICACIÓN DEL FINAL (NO AFECTA A GUNICORN, PERO ÚTIL) ---
+# Gunicorn ignora esto, pero si alguna vez ejecutas "python mi_api.py" sin docker, funcionará.
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    # Usamos socketio.run en lugar de app.run
+    socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)

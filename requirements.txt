@@ -5,9 +5,16 @@ PyJWT
 Flask-Mail
 Werkzeug
 pytz
-gunicorn  # ¡NUEVO y MUY IMPORTANTE!
-python-dotenv # Opcional, para cargar variables de entorno localmente
+gunicorn  
+python-dotenv 
 firebase-admin>=6.6.0
 flask_executor
 APScheduler
-curl_cffi>=0.5.10  # <--- AÑADE ESTA LÍNEA AL FINAL
+curl_cffi>=0.5.10
+# ------f1 real time--------
+fastf1
+flask-socketio
+eventlet
+pandas
+requests
+Flask-Cors
