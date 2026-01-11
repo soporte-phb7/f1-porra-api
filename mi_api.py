@@ -279,7 +279,7 @@ jwt = JWTManager(app) # Inicializa JWTManager con tu app
 # Es MUY RECOMENDABLE usar variables de entorno para esto en producción
 # Para probar localmente, puedes definirlas temporalmente o crear un archivo .env
 app.config["JWT_SECRET_KEY"] = os.environ.get('JWT_SECRET_KEY', 'cambiar-esta-clave-secreta-ya!')
-app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(days=14)
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(days=120)
 # Configuración para Gmail
 app.config['MAIL_SERVER'] = 'smtp.gmail.com'
 app.config['MAIL_PORT'] = 587 # Puerto para TLS
